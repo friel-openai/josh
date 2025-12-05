@@ -682,6 +682,7 @@ pub fn invert(filter: Filter) -> JoshResult<Filter> {
         Op::Pattern(pattern) => Some(Op::Pattern(pattern)),
         Op::Rev(_) => Some(Op::Nop),
         Op::RegexReplace(_) => Some(Op::Nop),
+        Op::Squash(..) => Some(Op::Nop),
         Op::Pin(_) => Some(Op::Nop),
         _ => None,
     };
