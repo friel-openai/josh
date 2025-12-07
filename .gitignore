@@ -6,3 +6,6 @@ e2e-tests/_remote*
 docs/_build
 .cargo_home
 .idea
+plans/
+AGENTS.md
+SURVEY.md
