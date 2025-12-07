@@ -18,8 +18,41 @@ pub(crate) use persist::{peel_op, to_filter, to_op};
 
 pub use crate::flang::{pretty, spec};
 pub use opt::invert;
+#[cfg(feature = "bench")]
+pub use opt::{optimize, prefix_sort};
 pub use parse::get_comments;
 pub use parse::parse;
+
+#[cfg(feature = "bench")]
+pub fn bench_exclude_files(paths: &[std::path::PathBuf]) -> Filter {
+    let filters = paths.iter().cloned().map(file).collect::<Vec<_>>();
+    to_filter(Op::Exclude(to_filter(Op::Compose(filters))))
+}
+
+#[cfg(feature = "bench")]
+pub fn bench_pin_files(paths: &[std::path::PathBuf]) -> Filter {
+    let filters = paths.iter().cloned().map(file).collect::<Vec<_>>();
+    to_filter(Op::Pin(to_filter(Op::Compose(filters))))
+}
+
+static EXCLUDE_FASTPATH_MODE: LazyLock<std::sync::atomic::AtomicU8> = LazyLock::new(|| {
+    use std::sync::atomic::AtomicU8;
+    // 0 = enabled (default), 1 = disabled.
+    let disabled = std::env::var_os("JOSH_DISABLE_EXCLUDE_FASTPATH").is_some();
+    AtomicU8::new(if disabled { 1 } else { 0 })
+});
+
+#[cfg(feature = "bench")]
+pub fn bench_set_exclude_fastpath_disabled(disabled: bool) {
+    use std::sync::atomic::Ordering;
+    EXCLUDE_FASTPATH_MODE.store(if disabled { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+fn exclude_fastpath_disabled() -> bool {
+    use std::sync::atomic::Ordering;
+    EXCLUDE_FASTPATH_MODE.load(Ordering::Relaxed) != 0
+}
+
 static WORKSPACES: LazyLock<std::sync::Mutex<std::collections::HashMap<git2::Oid, Filter>>> =
     LazyLock::new(Default::default);
 static ANCESTORS: LazyLock<
@@ -1548,6 +1581,65 @@ pub fn apply<'a>(
             Ok(x.with_tree(repo.find_tree(tree::subtract(transaction, af.tree().id(), ba)?)?))
         }
         Op::Exclude(b) => {
+            fn collect_paths(op: &Op, out: &mut Vec<std::path::PathBuf>) -> bool {
+                match op {
+                    Op::Compose(filters) => {
+                        for f in filters {
+                            if !collect_paths(&to_op(*f), out) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    Op::Chain(filters) => {
+                        if filters.len() == 2 {
+                            // Common directory-selector shorthand `::dir/` becomes `:/dir:prefix=dir`,
+                            // represented as `Chain(Subdir(dir), Prefix(dir))`.
+                            match (to_op(filters[0]), to_op(filters[1])) {
+                                (Op::Subdir(p1), Op::Prefix(p2)) if p1 == p2 => {
+                                    out.push(p1);
+                                    return true;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        let f = to_filter(op.clone());
+                        let src = src_path(f);
+                        let dst = dst_path(f);
+                        if src == dst && !src.as_os_str().is_empty() {
+                            out.push(src);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Op::File(dest, src) if dest == src => {
+                        if !src.as_os_str().is_empty() {
+                            out.push(src.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+
+            // Fast-path `:exclude[...]` for wide lists of *path selectors* (no remapping).
+            // For this common case, we can build a small “mask tree” directly from the selected
+            // paths and subtract it from the input tree, avoiding `Compose` semantics and avoiding
+            // `tree::compose`’s repeated overlay/taken bookkeeping.
+            let mut paths = Vec::new();
+            if !exclude_fastpath_disabled() && collect_paths(&to_op(*b), &mut paths) {
+                let mask = tree::mask_tree_from_paths(transaction, &paths)?;
+                return Ok(x.clone().with_tree(repo.find_tree(tree::subtract(
+                    transaction,
+                    x.tree().id(),
+                    mask,
+                )?)?));
+            }
+
             let bf = apply(transaction, *b, x.clone())?.tree().id();
             Ok(x.clone().with_tree(repo.find_tree(tree::subtract(
                 transaction,
@@ -2198,5 +2290,134 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    fn make_many_file_filters(n: usize, seed: u32) -> Vec<Filter> {
+        (0..n)
+            .map(|i| {
+                // Create many distinct, mostly non-overlapping leaf paths.
+                // `seed` lets the caller force a different filter set without parsing strings.
+                let dir = (i % 1024) as u32;
+                let path = format!("dir{dir:04}/file_{seed:08}_{i:08}.txt");
+                file(path)
+            })
+            .collect()
+    }
+
+    fn perf_n_default() -> usize {
+        std::env::var("JOSH_PERF_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5_000)
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_optimize_exclude_many_paths() {
+        use std::time::Instant;
+
+        let n = perf_n_default();
+        let filters = make_many_file_filters(n, 0);
+
+        let compose = to_filter(Op::Compose(filters));
+        let exclude = to_filter(Op::Exclude(compose));
+
+        let start = Instant::now();
+        let optimized = opt::optimize(exclude);
+        let dt = start.elapsed();
+
+        // Avoid the optimizer result getting fully optimized away in release builds.
+        std::hint::black_box(optimized);
+
+        println!("opt::optimize(:exclude[...{n}...]) = {:?}", dt);
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_optimize_pin_many_paths() {
+        use std::time::Instant;
+
+        let n = perf_n_default();
+        let filters = make_many_file_filters(n, 1);
+
+        let compose = to_filter(Op::Compose(filters));
+        let pin = to_filter(Op::Pin(compose));
+
+        let start = Instant::now();
+        let optimized = opt::optimize(pin);
+        let dt = start.elapsed();
+
+        std::hint::black_box(optimized);
+
+        println!("opt::optimize(:pin[...{n}...]) = {:?}", dt);
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_apply_exclude_many_paths() {
+        use std::time::Instant;
+
+        let n = perf_n_default();
+        let file_count = std::env::var("JOSH_PERF_FILES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(std::cmp::max(5_000, n));
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workdir = tmp.path().join("repo");
+        std::fs::create_dir_all(&workdir).expect("mkdirs");
+        let repo = git2::Repository::init(&workdir).expect("init repo");
+
+        let mut paths = Vec::with_capacity(file_count);
+        for i in 0..file_count {
+            let dir = (i % 256) as u32;
+            let p = std::path::PathBuf::from(format!("dir{dir:03}/file_{i:06}.txt"));
+            let abspath = workdir.join(&p);
+            if let Some(parent) = abspath.parent() {
+                std::fs::create_dir_all(parent).expect("mkdirs");
+            }
+            std::fs::write(&abspath, format!("content {i}\n")).expect("write file");
+            paths.push(p);
+        }
+
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        let tree_id = index.write_tree().expect("write tree");
+        index.write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("perf", "perf@example.com").unwrap();
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "perf commit", &tree, &[])
+            .unwrap();
+
+        // Josh transaction requires sled DB init.
+        let gitdir = repo.path().to_path_buf();
+        crate::cache_sled::sled_load(&gitdir).expect("sled_load");
+        let cache = std::sync::Arc::new(crate::cache_stack::CacheStack::new().with_backend(
+            crate::cache_sled::SledCacheBackend::default(),
+        ));
+        let tx = crate::cache::TransactionContext::new(&gitdir, cache)
+            .open(None)
+            .expect("open tx");
+
+        // Build an exclude list that removes the first N paths.
+        let filters = paths.iter().take(n).cloned().map(crate::filter::file).collect();
+        let exclude = crate::filter::to_filter(crate::filter::Op::Exclude(crate::filter::to_filter(
+            crate::filter::Op::Compose(filters),
+        )));
+        let exclude = crate::filter::opt::optimize(exclude);
+
+        let commit = tx.repo().find_commit(commit_oid).expect("commit");
+        let tree = commit.tree().expect("tree");
+
+        let start = Instant::now();
+        let out = crate::filter::apply(&tx, exclude, crate::filter::Rewrite::from_tree(tree))
+            .expect("apply");
+        let dt = start.elapsed();
+        std::hint::black_box(out.tree().id());
+
+        println!("apply(:exclude[...{n}...]) on tree({file_count} files) => {:?}", dt);
     }
 }
