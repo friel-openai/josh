@@ -6,7 +6,6 @@
 use super::*;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::LazyLock;
 
 static OPTIMIZED: LazyLock<std::sync::Mutex<std::collections::HashMap<Filter, Filter>>> =
@@ -203,76 +202,129 @@ fn last_chain(rest: Filter, filter: Filter) -> (Filter, Filter) {
 
 pub fn prefix_sort(filters: &[Filter]) -> Vec<Filter> {
     let n = filters.len();
-
-    // Step 1: Build graph of ordering constraints
-    let mut graph: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut indegree = vec![0; n];
-
-    for i in 0..n {
-        for j in i + 1..n {
-            let src_i = src_path(filters[i].clone());
-            let dst_i = dst_path(filters[i].clone());
-            let src_j = src_path(filters[j].clone());
-            let dst_j = dst_path(filters[j].clone());
-
-            let constraint = if src_j.starts_with(&src_i) || src_i.starts_with(&src_j) {
-                Some((i, j))
-            } else if dst_j.starts_with(&dst_i) || dst_i.starts_with(&dst_j) {
-                Some((i, j))
-            } else {
-                None
-            };
-
-            if let Some((a, b)) = constraint {
-                graph.entry(a).or_default().push(b);
-                indegree[b] += 1;
-            }
-        }
+    if n <= 1 {
+        return filters.to_vec();
     }
 
-    // Step 2: Sort indices alphabetically by (src, dst)
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by(|&i, &j| {
-        let key_i = (src_path(filters[i].clone()), dst_path(filters[i].clone()));
-        let key_j = (src_path(filters[j].clone()), dst_path(filters[j].clone()));
+    // `prefix_sort` stabilizes ordering of compose lists during optimization.
+    //
+    // Constraint rule: if two filters overlap (their src/dst paths have an ancestor/descendant
+    // prefix relationship), preserve their *original* relative order.
+    //
+    // The previous implementation checked every pair of filters (O(n²)). That becomes infeasible
+    // for large compose lists (e.g. `:exclude[...]` with tens of thousands of entries). This
+    // implementation generates the same constraints by indexing filters by their exact src/dst
+    // paths and only enumerating ancestor prefixes (roughly O(n * path_depth)).
 
-        match key_i.0.cmp(&key_j.0) {
-            Ordering::Equal => key_i.1.cmp(&key_j.1),
-            other => other,
-        }
-    });
-
-    // Step 3: Topological sort with alphabetical tie-break
-    let mut result = Vec::new();
-    let mut available: VecDeque<usize> = indices
+    let keys: Vec<(std::path::PathBuf, std::path::PathBuf)> = filters
         .iter()
-        .copied()
-        .filter(|&i| indegree[i] == 0)
+        .map(|f| (src_path(*f), dst_path(*f)))
         .collect();
 
-    while let Some(i) = available.pop_front() {
-        result.push(i);
-        if let Some(neighbors) = graph.get(&i) {
-            for &j in neighbors {
-                indegree[j] -= 1;
-                if indegree[j] == 0 {
-                    // Insert j into available, keeping alphabetical order
-                    let pos = available.iter().position(|&x| {
-                        let key_j = (src_path(filters[j].clone()), dst_path(filters[j].clone()));
-                        let key_x = (src_path(filters[x].clone()), dst_path(filters[x].clone()));
-                        key_j < key_x
-                    });
-                    if let Some(p) = pos {
-                        available.insert(p, j);
+    let mut src_index: HashMap<std::path::PathBuf, Vec<usize>> = HashMap::new();
+    let mut dst_index: HashMap<std::path::PathBuf, Vec<usize>> = HashMap::new();
+    for (i, (src, dst)) in keys.iter().enumerate() {
+        src_index.entry(src.clone()).or_default().push(i);
+        dst_index.entry(dst.clone()).or_default().push(i);
+    }
+
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let empty = std::path::PathBuf::new();
+
+    let mut add_edges_for_path =
+        |path: &std::path::PathBuf, idx: usize, index: &HashMap<std::path::PathBuf, Vec<usize>>| {
+            // Empty prefix overlaps with everything.
+            if let Some(indices) = index.get(&empty) {
+                for &other in indices {
+                    if other == idx {
+                        continue;
+                    }
+                    let (a, b) = if other < idx {
+                        (other, idx)
                     } else {
-                        available.push_back(j);
+                        (idx, other)
+                    };
+                    edges.push((a, b));
+                }
+            }
+
+            let mut prefix = std::path::PathBuf::new();
+            for comp in path.components() {
+                prefix.push(comp);
+                if let Some(indices) = index.get(&prefix) {
+                    for &other in indices {
+                        if other == idx {
+                            continue;
+                        }
+                        let (a, b) = if other < idx {
+                            (other, idx)
+                        } else {
+                            (idx, other)
+                        };
+                        edges.push((a, b));
                     }
                 }
             }
+        };
+
+    for i in 0..n {
+        add_edges_for_path(&keys[i].0, i, &src_index);
+        add_edges_for_path(&keys[i].1, i, &dst_index);
+    }
+
+    edges.sort_unstable();
+    edges.dedup();
+
+    let mut graph: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for (a, b) in edges {
+        graph[a].push(b);
+        indegree[b] += 1;
+    }
+
+    // Alphabetical order by (src, dst) for tie-breaking.
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&i, &j| match keys[i].0.cmp(&keys[j].0) {
+        Ordering::Equal => keys[i].1.cmp(&keys[j].1),
+        other => other,
+    });
+    let mut rank = vec![0usize; n];
+    for (pos, &idx) in indices.iter().enumerate() {
+        rank[idx] = pos;
+    }
+
+    let mut heap = std::collections::BinaryHeap::<std::cmp::Reverse<(usize, usize)>>::new();
+    for i in 0..n {
+        if indegree[i] == 0 {
+            heap.push(std::cmp::Reverse((rank[i], i)));
         }
     }
 
-    result.into_iter().map(|i| filters[i].clone()).collect()
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse((_r, i))) = heap.pop() {
+        if indegree[i] != 0 {
+            continue;
+        }
+        // Mark as emitted.
+        indegree[i] = usize::MAX;
+        out.push(i);
+
+        for &j in &graph[i] {
+            if indegree[j] == usize::MAX {
+                continue;
+            }
+            indegree[j] -= 1;
+            if indegree[j] == 0 {
+                heap.push(std::cmp::Reverse((rank[j], j)));
+            }
+        }
+    }
+
+    if out.len() != n {
+        return filters.to_vec();
+    }
+
+    out.into_iter().map(|i| filters[i]).collect()
 }
 
 fn common_pre(filters: &Vec<Filter>) -> Option<(Filter, Vec<Filter>)> {

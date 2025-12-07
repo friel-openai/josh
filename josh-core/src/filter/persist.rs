@@ -2,7 +2,7 @@ use gix_object::WriteTo;
 use gix_object::bstr::BString;
 use std::collections::HashMap;
 
-use crate::filter::{Filter, LazyRef, Op, to_filter, to_op};
+use crate::filter::{Filter, HashableRegex, LazyRef, Op, to_filter, to_op};
 use crate::{JoshResult, josh_error};
 
 fn push_blob_entries(
@@ -127,7 +127,7 @@ impl InMemoryBuilder {
 
     fn build_regex_replace_params(
         &mut self,
-        replacements: &[(regex::Regex, String)],
+        replacements: &[(HashableRegex, String)],
     ) -> gix_hash::ObjectId {
         let mut outer_entries = Vec::new();
         for (i, (regex, replacement)) in replacements.iter().enumerate() {
@@ -516,7 +516,7 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> JoshResult<Op> {
             let regex_str = std::str::from_utf8(regex_blob.content())?;
             let regex = regex::Regex::new(regex_str)
                 .map_err(|e| josh_error(&format!("invalid regex: {}", e)))?;
-            Ok(Op::Message(fmt, regex))
+            Ok(Op::Message(fmt, HashableRegex(regex)))
         }
         "subdir" => {
             let inner = repo.find_tree(entry.id())?;
@@ -820,7 +820,7 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> JoshResult<Op> {
                 let regex_str = std::str::from_utf8(regex_blob.content())?;
                 let replacement = std::str::from_utf8(replacement_blob.content())?.to_string();
                 let regex = regex::Regex::new(regex_str)?;
-                replacements.push((regex, replacement));
+                replacements.push((HashableRegex(regex), replacement));
             }
             Ok(Op::RegexReplace(replacements))
         }

@@ -39,3 +39,23 @@ toml = { workspace = true }
 
 [features]
 incubating = []
+bench = []
+
+[dev-dependencies]
+criterion = "0.7.0"
+tempfile = { workspace = true }
+
+[[bench]]
+name = "filter_perf"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "wide_filters"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "pin_wide"
+harness = false
+required-features = ["bench"]

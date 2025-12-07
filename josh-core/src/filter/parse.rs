@@ -144,8 +144,8 @@ fn parse_item(pair: pest::iterators::Pair<Rule>) -> JoshResult<Op> {
             let mut inner = pair.into_inner();
             let fmt = unquote(inner.next().unwrap().as_str());
             let regex = if let Some(r) = inner.next() {
-                regex::Regex::new(&unquote(r.as_str()))
-                    .map_err(|e| josh_error(&format!("invalid regex: {}", e)))?
+                HashableRegex(regex::Regex::new(&unquote(r.as_str()))
+                    .map_err(|e| josh_error(&format!("invalid regex: {}", e)))?)
             } else {
                 super::MESSAGE_MATCH_ALL_REGEX.clone()
             };
@@ -225,7 +225,7 @@ fn parse_item(pair: pest::iterators::Pair<Rule>) -> JoshResult<Op> {
                 .into_inner()
                 .map(|x| unquote(x.as_str()))
                 .tuples()
-                .map(|(regex, replacement)| Ok((regex::Regex::new(&regex)?, replacement)))
+                .map(|(regex, replacement)| Ok((HashableRegex(regex::Regex::new(&regex)?), replacement)))
                 .collect::<JoshResult<_>>()?;
 
             Ok(Op::RegexReplace(replacements))
