@@ -981,6 +981,85 @@ pub fn compose<'a>(
     Ok(result)
 }
 
+enum MaskNode {
+    Terminal,
+    Children(std::collections::BTreeMap<std::ffi::OsString, MaskNode>),
+}
+
+impl MaskNode {
+    fn insert_path(&mut self, path: &Path) {
+        match self {
+            MaskNode::Terminal => return,
+            MaskNode::Children(children) => {
+                let mut components = path.components();
+                let Some(first) = components.next() else {
+                    *self = MaskNode::Terminal;
+                    return;
+                };
+
+                let rest = components.as_path();
+                let key = first.as_os_str().to_os_string();
+
+                let entry = children.entry(key).or_insert_with(|| MaskNode::Children(Default::default()));
+                if rest.as_os_str().is_empty() {
+                    *entry = MaskNode::Terminal;
+                } else {
+                    entry.insert_path(rest);
+                }
+            }
+        }
+    }
+}
+
+pub fn mask_tree_from_paths(
+    transaction: &cache::Transaction,
+    paths: &[std::path::PathBuf],
+) -> JoshResult<git2::Oid> {
+    let repo = transaction.repo();
+
+    // A single marker blob reused for all leaf entries. Its contents are irrelevant; we only need
+    // the OID to be a blob so `subtract()` will remove matching entries.
+    let marker = repo.blob(b"mask")?;
+
+    let mut root = MaskNode::Children(Default::default());
+    for p in paths {
+        if p.as_os_str().is_empty() {
+            root = MaskNode::Terminal;
+            break;
+        }
+        root.insert_path(p);
+    }
+
+    fn write_node(
+        repo: &git2::Repository,
+        marker: git2::Oid,
+        node: &MaskNode,
+    ) -> JoshResult<git2::Oid> {
+        match node {
+            MaskNode::Terminal => Ok(marker),
+            MaskNode::Children(children) => {
+                let mut builder = repo.treebuilder(None)?;
+                for (name, child) in children {
+                    let oid = write_node(repo, marker, child)?;
+                    let mode = match child {
+                        MaskNode::Terminal => git2::FileMode::Blob.into(),
+                        MaskNode::Children(_) => git2::FileMode::Tree.into(),
+                    };
+                    builder.insert(std::path::Path::new(name), oid, mode)?;
+                }
+                Ok(builder.write()?)
+            }
+        }
+    }
+
+    match &root {
+        // An empty/terminal root means “remove everything”. Returning a blob OID as the mask makes
+        // `subtract(tree, mask_blob)` return the empty tree.
+        MaskNode::Terminal => Ok(marker),
+        MaskNode::Children(_) => Ok(write_node(repo, marker, &root)?),
+    }
+}
+
 pub fn get_blob(repo: &git2::Repository, tree: &git2::Tree, path: &Path) -> String {
     let entry_oid = ok_or!(tree.get_path(path).map(|x| x.id()), {
         return "".to_owned();
