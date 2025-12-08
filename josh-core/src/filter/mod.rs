@@ -807,9 +807,13 @@ pub fn apply_to_commit(
         }
 
         let missing = transaction.get_missing();
-
+        let mut by_filter: std::collections::HashMap<Filter, Vec<git2::Oid>> =
+            std::collections::HashMap::new();
         for (f, i) in missing {
-            history::walk2(f, i, transaction)?;
+            by_filter.entry(f).or_default().push(i);
+        }
+        for (f, inputs) in by_filter {
+            history::walk_many(f, &inputs, transaction)?;
         }
     }
 }
@@ -1281,7 +1285,25 @@ fn apply_to_commit2(
                 }
             }
 
+            // If the workspace filter itself is `:linear` (or chained with `:linear`), treat the
+            // history traversal as linear even though `get_workspace` wraps the filter with
+            // workspace bookkeeping (workspace.josh file + subdir/prefix).
+            //
+            // This avoids merge-heavy revwalk blowups when `:workspace` returns `:linear`.
+            let wsj_path = ws_path.join("workspace.josh");
+            let ws_linear = is_linear(get_filter(transaction, &commit.tree()?, &wsj_path));
+
             let commit_filter = get_workspace(transaction, &commit.tree()?, &ws_path);
+
+            if ws_linear {
+                let linearized = chain(to_filter(Op::Linear), commit_filter);
+                if let Some(r) = apply_to_commit2(&to_op(linearized), commit, transaction)? {
+                    transaction.insert(filter, commit.id(), r, true);
+                    return Ok(Some(r));
+                } else {
+                    return Ok(None);
+                }
+            }
 
             let parent_filters = commit
                 .parents()
@@ -1299,7 +1321,25 @@ fn apply_to_commit2(
             return per_rev_filter(transaction, commit, filter, commit_filter, parent_filters);
         }
         Op::Stored(s_path) => {
+            // If the stored filter content is `:linear` (or chained with `:linear`), treat the
+            // history traversal as linear even though `get_stored` wraps the filter with stored
+            // bookkeeping (the `*.josh` file itself).
+            //
+            // This avoids merge-heavy revwalk blowups when `:+name` resolves to `:linear`.
+            let stored_path = s_path.with_extension("josh");
+            let stored_linear = is_linear(get_filter(transaction, &commit.tree()?, &stored_path));
+
             let commit_filter = get_stored(transaction, &commit.tree()?, &s_path);
+
+            if stored_linear {
+                let linearized = chain(to_filter(Op::Linear), commit_filter);
+                if let Some(r) = apply_to_commit2(&to_op(linearized), commit, transaction)? {
+                    transaction.insert(filter, commit.id(), r, true);
+                    return Ok(Some(r));
+                } else {
+                    return Ok(None);
+                }
+            }
 
             let parent_filters = commit
                 .parents()
@@ -1340,6 +1380,18 @@ fn apply_to_commit2(
         }
         Op::Hook(hook) => {
             let commit_filter = transaction.lookup_filter_hook(&hook, commit.id())?;
+
+            // If the hook returns `:linear` (or is chained with `:linear`), treat history traversal
+            // as linear by delegating to the resolved filter and caching the result under the
+            // `:hook=...` filter key.
+            if is_linear(commit_filter) {
+                if let Some(r) = apply_to_commit2(&to_op(commit_filter), commit, transaction)? {
+                    transaction.insert(filter, commit.id(), r, true);
+                    return Ok(Some(r));
+                } else {
+                    return Ok(None);
+                }
+            }
 
             let parent_filters = commit
                 .parents()
@@ -2125,11 +2177,58 @@ fn is_ancestor_of(
 }
 
 pub fn is_linear(filter: Filter) -> bool {
-    match to_op(filter) {
-        Op::Linear => true,
-        Op::Chain(a, b) => is_linear(a) || is_linear(b),
-        _ => false,
+    fn is_tree_local(op: &Op) -> bool {
+        match op {
+            Op::Nop
+            | Op::Empty
+            | Op::Paths
+            | Op::RegexReplace(_)
+            | Op::Author(_, _)
+            | Op::Committer(_, _)
+            | Op::Pattern(_)
+            | Op::Message(_, _)
+            | Op::Index
+            | Op::Invert
+            | Op::File(_, _)
+            | Op::Prefix(_)
+            | Op::Subdir(_)
+            | Op::Prune
+            | Op::Unsign => true,
+            _ => false,
+        }
     }
+
+    fn is_linear_op(op: &Op) -> bool {
+        match op {
+            Op::Linear => true,
+            Op::Chain(a, b) => is_linear(*a) || is_linear(*b),
+            Op::Compose(filters) => {
+                let mut has_linear = false;
+                for f in filters {
+                    let opf = to_op(*f);
+                    if is_linear_op(&opf) {
+                        has_linear = true;
+                        continue;
+                    }
+                    if !is_tree_local(&opf) {
+                        return false;
+                    }
+                }
+                has_linear
+            }
+            Op::Exclude(f) | Op::Pin(f) => is_linear(*f),
+            Op::Subtract(a, b) => {
+                let oa = to_op(*a);
+                let ob = to_op(*b);
+                let a_ok = is_linear_op(&oa) || is_tree_local(&oa);
+                let b_ok = is_linear_op(&ob) || is_tree_local(&ob);
+                (a_ok && b_ok) && (is_linear_op(&oa) || is_linear_op(&ob))
+            }
+            _ => false,
+        }
+    }
+
+    is_linear_op(&to_op(filter))
 }
 
 fn legalize_pin<F>(f: Filter, c: &F) -> Filter
@@ -2195,6 +2294,64 @@ fn per_rev_filter(
     commit_filter: Filter,
     parent_filters: Vec<(git2::Commit, Filter)>,
 ) -> JoshResult<Option<git2::Oid>> {
+    let commit_filter_is_linear = is_linear(commit_filter);
+
+    if commit_filter_is_linear {
+        let mut parents = commit.parents();
+        if let Some(parent) = parents.next() {
+            let parent_id = parent.id();
+            let parent_filtered = some_or!(transaction.get(filter, parent_id), {
+                return Ok(None);
+            });
+
+            let mut tree_data = apply(transaction, commit_filter, Apply::from_commit(commit)?)?;
+
+            let pin_details = {
+                let legalized_a = legalize_pin(commit_filter, &|f| f);
+                let legalized_b = legalize_pin(commit_filter, &|f| to_filter(Op::Exclude(f)));
+
+                if legalized_a != legalized_b {
+                    let pin_subtract = apply(
+                        transaction,
+                        opt::optimize(to_filter(Op::Subtract(legalized_a, legalized_b))),
+                        Apply::from_commit(commit)?,
+                    )?;
+
+                    let parent = transaction.repo().find_commit(parent_filtered)?;
+
+                    let pin_overlay = tree::populate(
+                        transaction,
+                        tree::pathstree("", pin_subtract.tree.id(), transaction)?.id(),
+                        parent.tree_id(),
+                    )?;
+
+                    Some((pin_subtract.tree.id(), pin_overlay))
+                } else {
+                    None
+                }
+            };
+
+            if let Some((pin_subtract, pin_overlay)) = pin_details {
+                let with_exclude = tree::subtract(transaction, tree_data.tree().id(), pin_subtract)?;
+                let with_overlay = tree::overlay(transaction, pin_overlay, with_exclude)?;
+
+                tree_data = tree_data.with_tree(transaction.repo().find_tree(with_overlay)?);
+            }
+
+            return Some(history::create_filtered_commit(
+                commit,
+                vec![parent_filtered],
+                tree_data,
+                transaction,
+                filter,
+            ))
+            .transpose();
+        } else {
+            transaction.insert(filter, commit.id(), commit.id(), true);
+            return Ok(Some(commit.id()));
+        }
+    }
+
     // Compute the difference between the current commit's filter and each parent's filter.
     // This determines what new content should be contributed by that parent in the filtered history.
     let extra_parents = parent_filters
@@ -2271,6 +2428,17 @@ fn per_rev_filter(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    fn init_sled_cache_for_tests() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            // Leak the tempdir so it lives for the entire test process.
+            let tmp = Box::leak(Box::new(tmp));
+            crate::cache_sled::sled_load(tmp.path()).expect("sled_load");
+        });
+    }
 
     #[test]
     fn src_path_test() {
@@ -2343,6 +2511,246 @@ mod tests {
         assert!(!spec_str.is_empty());
     }
 
+    #[test]
+    fn exclude_parses_and_excludes_unquoted_special_paths() {
+        init_sled_cache_for_tests();
+
+        let excluded_paths = [
+            "alpha@beta.txt",
+            "gamma+(1).txt",
+            "epsilon(inner).txt",
+            // `[` and `]` are reserved by the filter language, so they must be quoted.
+            "open[bracket.txt",
+            "close]bracket.txt",
+        ];
+        let kept_path = "keep-me.txt";
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workdir = tmp.path().join("repo");
+        std::fs::create_dir_all(&workdir).expect("create workdir");
+        let repo = git2::Repository::init(&workdir).expect("init repo");
+
+        for path in excluded_paths.iter().copied().chain([kept_path])
+        {
+            let abspath = workdir.join(path);
+            if let Some(parent) = abspath.parent() {
+                std::fs::create_dir_all(parent).expect("mkdirs");
+            }
+            std::fs::write(&abspath, format!("content {path}\n")).expect("write file");
+        }
+
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        let tree_id = index.write_tree().expect("write tree");
+        index.write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "commit", &tree, &[])
+            .unwrap();
+
+        let gitdir = repo.path().to_path_buf();
+        let cache = std::sync::Arc::new(crate::cache_stack::CacheStack::new().with_backend(
+            crate::cache_sled::SledCacheBackend::default(),
+        ));
+        let tx = crate::cache::TransactionContext::new(&gitdir, cache)
+            .open(None)
+            .expect("open tx");
+
+        let spec = format!(
+            ":exclude[{}]",
+            excluded_paths
+                .iter()
+                .map(|p| format!("::{}", parse::quote_if(p)))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let filter = opt::optimize(parse(&spec).expect("parse exclude spec"));
+
+        let commit = tx.repo().find_commit(commit_oid).expect("find commit");
+        let tree = commit.tree().expect("tree");
+        let filtered = apply(&tx, filter, Apply::from_tree(tree)).expect("apply");
+
+        for path in excluded_paths {
+            assert!(
+                filtered.tree().get_path(std::path::Path::new(path)).is_err(),
+                "path {path} should be excluded"
+            );
+        }
+        assert!(
+            filtered.tree().get_path(std::path::Path::new(kept_path)).is_ok(),
+            "control path should remain"
+        );
+    }
+
+    #[test]
+    fn stored_linear_flattens_merges() {
+        init_sled_cache_for_tests();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workdir = tmp.path().join("repo");
+        std::fs::create_dir_all(&workdir).expect("create workdir");
+        let repo = git2::Repository::init(&workdir).expect("init repo");
+
+        // Create a tree that contains a stored filter file `linear.josh` returning `:linear`.
+        std::fs::write(workdir.join("linear.josh"), ":linear\n").expect("write linear.josh");
+        std::fs::write(workdir.join("content.txt"), "content\n").expect("write content");
+
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        let tree_id = index.write_tree().expect("write tree");
+        index.write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let root_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
+            .unwrap();
+        let mut head_oid = root_oid;
+
+        // Build a merge-heavy history with divergent parents: repeatedly create a side commit from
+        // `root` and merge it into the growing mainline.
+        let merges = 30usize;
+        for i in 0..merges {
+            let head = repo.find_commit(head_oid).expect("head commit");
+            let root = repo.find_commit(root_oid).expect("root commit");
+            let side_oid = repo
+                .commit(
+                    None,
+                    &sig,
+                    &sig,
+                    &format!("side {i}"),
+                    &tree,
+                    &[&root],
+                )
+                .unwrap();
+            let side = repo.find_commit(side_oid).expect("side commit");
+
+            head_oid = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &format!("merge {i}"),
+                    &tree,
+                    &[&head, &side],
+                )
+                .unwrap();
+        }
+
+        let gitdir = repo.path().to_path_buf();
+        let cache = std::sync::Arc::new(crate::cache_stack::CacheStack::new().with_backend(
+            crate::cache_sled::SledCacheBackend::default(),
+        ));
+        let tx = crate::cache::TransactionContext::new(&gitdir, cache)
+            .open(None)
+            .expect("open tx");
+
+        let filter = parse(":+linear").expect("parse stored filter");
+        let head = tx.repo().find_commit(head_oid).expect("find head");
+        let filtered_oid = apply_to_commit(filter, &head, &tx).expect("apply_to_commit");
+        let mut filtered = tx.repo().find_commit(filtered_oid).expect("filtered commit");
+
+        // `:linear` must flatten merges: filtered commits have at most one parent.
+        for _ in 0..(merges + 5) {
+            assert!(
+                filtered.parent_count() <= 1,
+                "filtered history should be linear (found merge)"
+            );
+            if filtered.parent_count() == 0 {
+                break;
+            }
+            filtered = filtered.parent(0).expect("parent");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_stored_linear_merge_scaling() {
+        use std::time::Instant;
+
+        init_sled_cache_for_tests();
+
+        let merges: usize = std::env::var("JOSH_LINEAR_MERGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workdir = tmp.path().join("repo");
+        std::fs::create_dir_all(&workdir).expect("create workdir");
+        let repo = git2::Repository::init(&workdir).expect("init repo");
+
+        std::fs::write(workdir.join("linear.josh"), ":linear\n").expect("write linear.josh");
+        std::fs::write(workdir.join("content.txt"), "content\n").expect("write content");
+
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        let tree_id = index.write_tree().expect("write tree");
+        index.write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let root_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "root", &tree, &[])
+            .unwrap();
+        let mut head_oid = root_oid;
+
+        for i in 0..merges {
+            let head = repo.find_commit(head_oid).expect("head commit");
+            let root = repo.find_commit(root_oid).expect("root commit");
+            let side_oid = repo
+                .commit(None, &sig, &sig, &format!("side {i}"), &tree, &[&root])
+                .unwrap();
+            let side = repo.find_commit(side_oid).expect("side commit");
+
+            head_oid = repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &format!("merge {i}"),
+                    &tree,
+                    &[&head, &side],
+                )
+                .unwrap();
+        }
+
+        let gitdir = repo.path().to_path_buf();
+        let cache = std::sync::Arc::new(crate::cache_stack::CacheStack::new().with_backend(
+            crate::cache_sled::SledCacheBackend::default(),
+        ));
+        let tx = crate::cache::TransactionContext::new(&gitdir, cache)
+            .open(None)
+            .expect("open tx");
+
+        let filter = parse(":+linear").expect("parse stored filter");
+        let head = tx.repo().find_commit(head_oid).expect("find head");
+
+        let start = Instant::now();
+        let filtered_oid = apply_to_commit(filter, &head, &tx).expect("apply_to_commit");
+        let dt = start.elapsed();
+        println!("apply_to_commit(:+linear) merges={merges} => {:?}", dt);
+
+        let mut filtered = tx.repo().find_commit(filtered_oid).expect("filtered commit");
+        for _ in 0..(merges + 5) {
+            assert!(
+                filtered.parent_count() <= 1,
+                "filtered history should be linear (found merge)"
+            );
+            if filtered.parent_count() == 0 {
+                break;
+            }
+            filtered = filtered.parent(0).expect("parent");
+        }
+    }
+
     fn make_many_file_filters(n: usize, seed: u32) -> Vec<Filter> {
         (0..n)
             .map(|i| {
@@ -2372,6 +2780,8 @@ mod tests {
     fn perf_optimize_exclude_many_paths() {
         use std::time::Instant;
 
+        init_sled_cache_for_tests();
+
         let n = perf_n_default();
         let filters = make_many_file_filters(n, 0);
 
@@ -2393,6 +2803,8 @@ mod tests {
     fn perf_optimize_pin_many_paths() {
         use std::time::Instant;
 
+        init_sled_cache_for_tests();
+
         let n = perf_n_default();
         let filters = make_many_file_filters(n, 1);
 
@@ -2411,13 +2823,17 @@ mod tests {
     #[test]
     #[ignore]
     fn perf_apply_exclude_many_paths() {
+        use std::io::Write;
         use std::time::Instant;
+
+        init_sled_cache_for_tests();
 
         let n = perf_n_default();
         let file_count = std::env::var("JOSH_PERF_FILES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(std::cmp::max(5_000, n));
+        let use_mempack = std::env::var_os("JOSH_ENABLE_MEMPACK").is_some();
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let workdir = tmp.path().join("repo");
@@ -2448,15 +2864,23 @@ mod tests {
             .commit(Some("HEAD"), &sig, &sig, "perf commit", &tree, &[])
             .unwrap();
 
-        // Josh transaction requires sled DB init.
         let gitdir = repo.path().to_path_buf();
-        crate::cache_sled::sled_load(&gitdir).expect("sled_load");
         let cache = std::sync::Arc::new(crate::cache_stack::CacheStack::new().with_backend(
             crate::cache_sled::SledCacheBackend::default(),
         ));
         let tx = crate::cache::TransactionContext::new(&gitdir, cache)
             .open(None)
             .expect("open tx");
+
+        // Optional: mirror `josh-filter --pack` semantics by enabling libgit2's mempack backend and
+        // committing it into the repo ODB after the filter operation finishes.
+        let repo = tx.repo();
+        let odb = repo.odb().expect("odb");
+        let mempack = if use_mempack {
+            odb.add_new_mempack_backend(1000).ok()
+        } else {
+            None
+        };
 
         // Build an exclude list that removes the first N paths.
         let filters = paths
@@ -2478,6 +2902,16 @@ mod tests {
             .expect("apply");
         let dt = start.elapsed();
         std::hint::black_box(out.tree().id());
+
+        if let Some(mempack) = mempack {
+            let mut buf = git2::Buf::new();
+            mempack.dump(repo, &mut buf).unwrap();
+            if buf.len() > 32 {
+                let mut w = odb.packwriter().unwrap();
+                w.write(&buf).unwrap();
+                w.commit().unwrap();
+            }
+        }
 
         println!("apply(:exclude[...{n}...]) on tree({file_count} files) => {:?}", dt);
     }
