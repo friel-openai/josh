@@ -393,6 +393,12 @@ fn unquote(s: &str) -> String {
 // Encode string as json if it contains any chars reserved
 // by the filter language
 pub fn quote_if(s: &str) -> String {
+    // Pest treats `WHITESPACE` as skippable between tokens, so a pure-grammar check is not enough
+    // to detect spaces inside a path. Spaces are reserved by the filter language and must be
+    // quoted to preserve round-trips and avoid ambiguity.
+    if s.chars().any(|c| c.is_whitespace()) {
+        return quote(s);
+    }
     if let Ok(r) = Grammar::parse(Rule::filter_path, s) {
         if r.as_str() == s {
             return s.to_string();
@@ -453,3 +459,50 @@ pub fn get_comments(filter_spec: &str) -> JoshResult<String> {
 #[derive(pest_derive::Parser)]
 #[grammar = "flang/grammar.pest"]
 struct Grammar;
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::{Grammar, Rule};
+    use pest::Parser;
+
+    #[test]
+    fn path_handles_special_chars() {
+        let paths = [
+            "alpha@beta.txt",
+            "gamma+(1).txt",
+            "epsilon(inner).txt",
+            // `[` is supported unquoted, `]` is reserved by the filter language.
+            "zeta[inner.txt",
+        ];
+        for path in &paths {
+            Grammar::parse(Rule::path, path).unwrap_or_else(|_| panic!("failed for {path}"));
+        }
+    }
+
+    #[test]
+    fn filter_chain_handles_special_paths() {
+        // `@`, `+`, `(`, `)` and `[` should be accepted unquoted. `]` remains reserved and must be
+        // quoted.
+        let spec = r#":exclude[::alpha@beta.txt,::gamma+(1).txt,::zeta[inner.txt,::"zeta[inner].txt"]"#;
+        Grammar::parse(Rule::filter_chain, spec)
+            .expect("Grammar should parse special char exclude filter");
+    }
+
+    #[test]
+    fn quote_if_quotes_spaces() {
+        let quoted = super::quote_if("has space.txt");
+        assert_eq!(quoted, "\"has space.txt\"");
+
+        let spec = format!(":exclude[::{}]", quoted);
+        Grammar::parse(Rule::filter_chain, &spec).expect("quoted space path should parse");
+    }
+
+    #[test]
+    fn quote_if_quotes_close_bracket() {
+        let quoted = super::quote_if("close]bracket.txt");
+        assert_eq!(quoted, "\"close]bracket.txt\"");
+
+        let spec = format!(":exclude[::{}]", quoted);
+        Grammar::parse(Rule::filter_chain, &spec).expect("quoted `]` path should parse");
+    }
+}

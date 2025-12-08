@@ -7,26 +7,44 @@ pub fn walk2(
     input: git2::Oid,
     transaction: &cache::Transaction,
 ) -> JoshResult<()> {
-    rs_tracing::trace_scoped!("walk2","spec":filter::spec(filter), "id": input.to_string());
+    walk_many(filter, &[input], transaction)
+}
 
-    if transaction.known(filter, input) {
+pub fn walk_many(
+    filter: filter::Filter,
+    inputs: &[git2::Oid],
+    transaction: &cache::Transaction,
+) -> JoshResult<()> {
+    let first = inputs.first().copied().unwrap_or_else(git2::Oid::zero);
+    rs_tracing::trace_scoped!(
+        "walk2",
+        "spec": filter::spec(filter),
+        "id": first.to_string(),
+        "count": inputs.len().to_string()
+    );
+
+    let mut walk = transaction.repo().revwalk()?;
+    if filter::is_linear(filter) {
+        walk.simplify_first_parent()?;
+    }
+    walk.set_sorting(git2::Sort::REVERSE | git2::Sort::TOPOLOGICAL)?;
+
+    let mut any_pushed = false;
+    for &input in inputs {
+        if transaction.known(filter, input) {
+            continue;
+        }
+        if transaction.repo().find_commit(input).is_err() {
+            continue;
+        }
+        walk.push(input)?;
+        any_pushed = true;
+    }
+
+    if !any_pushed {
         return Ok(());
     }
 
-    ok_or!(transaction.repo().find_commit(input), {
-        return Ok(());
-    });
-
-    let walk = {
-        let mut walk = transaction.repo().revwalk()?;
-        if filter::is_linear(filter) {
-            walk.simplify_first_parent()?;
-        }
-        walk.set_sorting(git2::Sort::REVERSE | git2::Sort::TOPOLOGICAL)?;
-
-        walk.push(input)?;
-        walk
-    };
     let mut hide_callback = |id| {
         let k = transaction.known(filter, id);
         k
