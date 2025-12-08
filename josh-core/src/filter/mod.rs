@@ -1980,11 +1980,59 @@ pub fn is_ancestor_of(
 }
 
 pub fn is_linear(filter: Filter) -> bool {
-    match peel_op(filter) {
-        Op::Linear => true,
-        Op::Chain(filters) => filters.iter().any(|f| is_linear(*f)),
-        _ => false,
+    fn is_tree_local(op: &Op) -> bool {
+        match op {
+            Op::Nop
+            | Op::Empty
+            | Op::Paths
+            | Op::RegexReplace(_)
+            | Op::Author(_, _)
+            | Op::Committer(_, _)
+            | Op::Pattern(_)
+            | Op::Message(_, _)
+            | Op::Index
+            | Op::Invert
+            | Op::File(_, _)
+            | Op::Prefix(_)
+            | Op::Subdir(_)
+            | Op::Prune
+            | Op::Unsign => true,
+            _ => false,
+        }
     }
+
+    fn is_linear_op(op: &Op) -> bool {
+        match op {
+            Op::Linear => true,
+            Op::Chain(filters) => filters.iter().any(|f| is_linear(*f)),
+            Op::Compose(filters) => {
+                let mut has_linear = false;
+                for f in filters {
+                    let opf = to_op(*f);
+                    if is_linear_op(&opf) {
+                        has_linear = true;
+                        continue;
+                    }
+                    if !is_tree_local(&opf) {
+                        return false;
+                    }
+                }
+                has_linear
+            }
+            Op::Exclude(f) | Op::Pin(f) => is_linear(*f),
+            Op::Subtract(a, b) => {
+                let oa = to_op(*a);
+                let ob = to_op(*b);
+                let a_ok = is_linear_op(&oa) || is_tree_local(&oa);
+                let b_ok = is_linear_op(&ob) || is_tree_local(&ob);
+                (a_ok && b_ok) && (is_linear_op(&oa) || is_linear_op(&ob))
+            }
+            Op::Meta(_, f) => is_linear(*f),
+            _ => false,
+        }
+    }
+
+    is_linear_op(&to_op(filter))
 }
 
 fn legalize_pin<F>(f: Filter, c: &F) -> Filter
