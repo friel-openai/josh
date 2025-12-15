@@ -72,6 +72,44 @@ pub(crate) static MESSAGE_MATCH_ALL_REGEX: LazyLock<regex::Regex> =
 #[serde(try_from = "String", into = "String")]
 pub struct Filter(git2::Oid);
 
+impl Filter {
+    #[inline]
+    pub fn oid(self) -> git2::Oid {
+        self.0
+    }
+}
+
+pub fn trace_filter_label(filter: Filter) -> String {
+    #[cfg(feature = "trace_filter_specs")]
+    {
+        thread_local! {
+            static IN_TRACE_FILTER_LABEL: std::cell::Cell<bool> = std::cell::Cell::new(false);
+        }
+
+        // Avoid recursion when trace payloads request `spec(filter)` and `spec(...)` itself runs
+        // through optimizer helpers that emit tracing scopes.
+        let already_in = IN_TRACE_FILTER_LABEL.with(|f| {
+            let v = f.get();
+            if !v {
+                f.set(true);
+            }
+            v
+        });
+        if already_in {
+            return filter.oid().to_string();
+        }
+
+        let out = spec(filter);
+        IN_TRACE_FILTER_LABEL.with(|f| f.set(false));
+        out
+    }
+
+    #[cfg(not(feature = "trace_filter_specs"))]
+    {
+        filter.oid().to_string()
+    }
+}
+
 impl std::convert::TryFrom<String> for Filter {
     type Error = JoshError;
     fn try_from(s: String) -> JoshResult<Filter> {
@@ -414,9 +452,66 @@ impl<'a> Rewrite<'a> {
 
 pub use crate::build::compose;
 
+pub fn empty() -> Filter {
+    to_filter(Op::Empty)
+}
+
+pub fn message(m: &str) -> Filter {
+    to_filter(Op::Message(m.to_string(), MESSAGE_MATCH_ALL_REGEX.clone()))
+}
+
+pub fn file(path: impl Into<std::path::PathBuf>) -> Filter {
+    let p = path.into();
+    to_filter(Op::File(p.clone(), p))
+}
+
+pub fn hook(h: &str) -> Filter {
+    to_filter(Op::Hook(h.to_string()))
+}
+
 /// Create a sequence_number filter used for tracking commit sequence numbers
 pub fn sequence_number() -> Filter {
     Filter::from_oid(git2::Oid::zero())
+}
+
+#[cfg(feature = "pathset_builders")]
+pub fn pin_paths<I, P>(paths: I) -> Filter
+where
+    I: IntoIterator<Item = P>,
+    P: Into<std::path::PathBuf>,
+{
+    let mut v: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+    v.sort();
+    v.dedup();
+
+    let filters = v.into_iter().map(file).collect::<Vec<_>>();
+    opt::optimize(to_filter(Op::Pin(to_filter(Op::Compose(filters)))))
+}
+
+#[cfg(feature = "pathset_builders")]
+pub fn exclude_paths<I, P>(paths: I) -> Filter
+where
+    I: IntoIterator<Item = P>,
+    P: Into<std::path::PathBuf>,
+{
+    let mut v: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+    v.sort();
+    v.dedup();
+
+    let filters = v.into_iter().map(file).collect::<Vec<_>>();
+    opt::optimize(to_filter(Op::Exclude(to_filter(Op::Compose(filters)))))
+}
+
+pub fn squash(ids: Option<&[(git2::Oid, Filter)]>) -> Filter {
+    if let Some(ids) = ids {
+        to_filter(Op::Squash(Some(
+            ids.iter()
+                .map(|(x, y)| (LazyRef::Resolved(*x), *y))
+                .collect(),
+        )))
+    } else {
+        to_filter(Op::Squash(None))
+    }
 }
 
 pub fn lazy_refs(filter: Filter) -> Vec<String> {
@@ -749,7 +844,11 @@ pub fn apply_to_commit2(
         }
     };
 
-    rs_tracing::trace_scoped!("apply_to_commit", "spec": spec(filter), "commit": commit.id().to_string());
+    rs_tracing::trace_scoped!(
+        "apply_to_commit",
+        "filter": trace_filter_label(filter),
+        "commit": commit.id().to_string()
+    );
 
     let rewrite_data = match &op {
         Op::Rev(filters) => {
@@ -2442,9 +2541,9 @@ mod tests {
 
         // Josh transaction requires sled DB init.
         let gitdir = repo.path().to_path_buf();
-        crate::cache_sled::sled_load(&gitdir).expect("sled_load");
-        let cache = std::sync::Arc::new(crate::cache_stack::CacheStack::new().with_backend(
-            crate::cache_sled::SledCacheBackend::default(),
+        crate::cache::sled_load(&gitdir).expect("sled_load");
+        let cache = std::sync::Arc::new(crate::cache::CacheStack::new().with_backend(
+            crate::cache::SledCacheBackend::default(),
         ));
         let tx = crate::cache::TransactionContext::new(&gitdir, cache)
             .open(None)

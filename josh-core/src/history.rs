@@ -18,7 +18,7 @@ pub fn walk_many(
     let first = inputs.first().copied().unwrap_or_else(git2::Oid::zero);
     rs_tracing::trace_scoped!(
         "walk2",
-        "spec": filter::spec(filter),
+        "filter": filter::trace_filter_label(filter),
         "id": first.to_string(),
         "count": inputs.len().to_string()
     );
