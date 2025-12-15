@@ -61,6 +61,44 @@ static MESSAGE_MATCH_ALL_REGEX: LazyLock<HashableRegex> =
 #[serde(try_from = "String", into = "String")]
 pub struct Filter(git2::Oid);
 
+impl Filter {
+    #[inline]
+    pub fn oid(self) -> git2::Oid {
+        self.0
+    }
+}
+
+pub fn trace_filter_label(filter: Filter) -> String {
+    #[cfg(feature = "trace_filter_specs")]
+    {
+        thread_local! {
+            static IN_TRACE_FILTER_LABEL: std::cell::Cell<bool> = std::cell::Cell::new(false);
+        }
+
+        // Avoid recursion when trace payloads request `spec(filter)` and `spec(...)` itself runs
+        // through optimizer helpers that emit tracing scopes.
+        let already_in = IN_TRACE_FILTER_LABEL.with(|f| {
+            let v = f.get();
+            if !v {
+                f.set(true);
+            }
+            v
+        });
+        if already_in {
+            return filter.oid().to_string();
+        }
+
+        let out = spec(filter);
+        IN_TRACE_FILTER_LABEL.with(|f| f.set(false));
+        out
+    }
+
+    #[cfg(not(feature = "trace_filter_specs"))]
+    {
+        filter.oid().to_string()
+    }
+}
+
 impl std::convert::TryFrom<String> for Filter {
     type Error = JoshError;
     fn try_from(s: String) -> JoshResult<Filter> {
@@ -262,6 +300,44 @@ pub fn file(path: impl Into<std::path::PathBuf>) -> Filter {
 
 pub fn hook(h: &str) -> Filter {
     to_filter(Op::Hook(h.to_string()))
+}
+
+#[cfg(feature = "pathset_builders")]
+pub fn pin_paths<I, P>(paths: I) -> Filter
+where
+    I: IntoIterator<Item = P>,
+    P: Into<std::path::PathBuf>,
+{
+    let mut v: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+    v.sort();
+    v.dedup();
+
+    let filters = v
+        .iter()
+        .cloned()
+        .map(|p| to_filter(Op::File(p.clone(), p)))
+        .collect::<Vec<_>>();
+
+    opt::optimize(to_filter(Op::Pin(to_filter(Op::Compose(filters)))))
+}
+
+#[cfg(feature = "pathset_builders")]
+pub fn exclude_paths<I, P>(paths: I) -> Filter
+where
+    I: IntoIterator<Item = P>,
+    P: Into<std::path::PathBuf>,
+{
+    let mut v: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+    v.sort();
+    v.dedup();
+
+    let filters = v
+        .iter()
+        .cloned()
+        .map(|p| to_filter(Op::File(p.clone(), p)))
+        .collect::<Vec<_>>();
+
+    opt::optimize(to_filter(Op::Exclude(to_filter(Op::Compose(filters)))))
 }
 
 pub fn squash(ids: Option<&[(git2::Oid, Filter)]>) -> Filter {
@@ -957,7 +1033,11 @@ fn apply_to_commit2(
         }
     };
 
-    rs_tracing::trace_scoped!("apply_to_commit", "spec": spec(filter), "commit": commit.id().to_string());
+    rs_tracing::trace_scoped!(
+        "apply_to_commit",
+        "filter": trace_filter_label(filter),
+        "commit": commit.id().to_string()
+    );
 
     let rewrite_data = match &to_op(filter) {
         Op::Rev(filters) => {

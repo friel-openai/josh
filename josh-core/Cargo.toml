@@ -38,8 +38,12 @@ tracing = { workspace = true }
 toml = { workspace = true }
 
 [features]
+default = ["fast_quote_if", "pathset_builders"]
 incubating = []
 bench = []
+fast_quote_if = []
+trace_filter_specs = []
+pathset_builders = []
 
 [dev-dependencies]
 criterion = "0.7.0"
@@ -57,5 +61,10 @@ required-features = ["bench"]
 
 [[bench]]
 name = "pin_wide"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "hook_wide_filters"
 harness = false
 required-features = ["bench"]

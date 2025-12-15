@@ -49,7 +49,7 @@ pub fn simplify(filter: Filter) -> Filter {
     if let Some(f) = SIMPLIFIED.lock().unwrap().get(&filter) {
         return *f;
     }
-    rs_tracing::trace_scoped!("simplify", "spec": spec2(&to_op(filter)));
+    rs_tracing::trace_scoped!("simplify", "filter": trace_filter_label(filter));
     let original = filter;
     let result = to_filter(match to_op(filter) {
         Op::Compose(filters) => {
@@ -100,7 +100,7 @@ pub fn simplify(filter: Filter) -> Filter {
  * the difference between two complex filters.
  */
 pub fn flatten(filter: Filter) -> Filter {
-    rs_tracing::trace_scoped!("flatten", "spec": spec(filter));
+    rs_tracing::trace_scoped!("flatten", "filter": trace_filter_label(filter));
     let original = filter;
     let result = to_filter(match to_op(filter) {
         Op::Compose(filters) => {
@@ -421,7 +421,7 @@ fn step(filter: Filter) -> Filter {
     if let Some(f) = OPTIMIZED.lock().unwrap().get(&filter) {
         return *f;
     }
-    rs_tracing::trace_scoped!("step", "spec": spec(filter));
+    rs_tracing::trace_scoped!("step", "filter": trace_filter_label(filter));
     let original = filter;
     let result = to_filter(match to_op(filter) {
         Op::Subdir(path) => {
@@ -575,7 +575,7 @@ pub fn invert(filter: Filter) -> JoshResult<Filter> {
     if let Some(f) = INVERTED.lock().unwrap().get(&filter) {
         return Ok(*f);
     }
-    rs_tracing::trace_scoped!("invert", "spec": spec(filter));
+    rs_tracing::trace_scoped!("invert", "filter": trace_filter_label(filter));
 
     let result = to_filter(match to_op(filter) {
         Op::Chain(a, b) => Op::Chain(invert(b)?, invert(a)?),

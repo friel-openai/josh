@@ -347,18 +347,53 @@ fn unquote(s: &str) -> String {
 // Encode string as json if it contains any chars reserved
 // by the filter language
 pub fn quote_if(s: &str) -> String {
+    // Paths are printed in hot loops (spec/spec2). The original implementation relied on Pest to
+    // validate PATH grammar, which is expensive for very wide filters (50k+ paths).
+    //
+    // Keep a cheap, grammar-aligned check on the hot path and fall back to JSON quoting when the
+    // string contains any reserved characters.
+    //
+    // Feature toggle:
+    // - With `fast_quote_if` (default): use the fast character-class check.
+    // - Without: use the previous Pest-based validation.
+
     // Pest treats `WHITESPACE` as skippable between tokens, so a pure-grammar check is not enough
     // to detect spaces inside a path. Spaces are reserved by the filter language and must be
     // quoted to preserve round-trips and avoid ambiguity.
     if s.chars().any(|c| c.is_whitespace()) {
         return quote(s);
     }
-    if let Ok(r) = Grammar::parse(Rule::filter_path, s) {
-        if r.as_str() == s {
+
+    #[cfg(feature = "fast_quote_if")]
+    {
+        // Mirror `filter/grammar.pest`:
+        // PATH = (PATH_ALNUM | "/")+
+        // PATH_ALNUM = ( ASCII_ALPHANUMERIC | "_" | "-" | "+" | "." | "*" | "~" | "@" | "(" | ")" | "[" )
+        //
+        // `]` remains reserved (group terminator) and must be quoted.
+        if !s.is_empty()
+            && s.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(
+                        c,
+                        '_' | '-' | '+' | '.' | '*' | '~' | '@' | '(' | ')' | '[' | '/'
+                    )
+            })
+        {
             return s.to_string();
         }
+        return quote(s);
     }
-    quote(s)
+
+    #[cfg(not(feature = "fast_quote_if"))]
+    {
+        if let Ok(r) = Grammar::parse(Rule::filter_path, s) {
+            if r.as_str() == s {
+                return s.to_string();
+            }
+        }
+        quote(s)
+    }
 }
 
 pub fn quote(s: &str) -> String {
