@@ -257,7 +257,7 @@ pub fn filter_refs(
     refs: &[(String, git2::Oid)],
     permissions: filter::Filter,
 ) -> (Vec<(String, git2::Oid)>, Vec<(String, JoshError)>) {
-    rs_tracing::trace_scoped!("filter_refs", "spec": filter::spec(filterobj));
+    rs_tracing::trace_scoped!("filter_refs", "filter": filter::trace_filter_label(filterobj));
     let s = tracing::Span::current();
     let _e = s.enter();
     let mut updated = vec![];

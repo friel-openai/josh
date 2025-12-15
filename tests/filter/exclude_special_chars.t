@@ -11,7 +11,7 @@
   $ git add .
   $ git commit -m "add files" 1> /dev/null
 
-  $ josh-filter -s ':exclude[::alpha@beta.txt,::gamma+(1).txt,::zeta[inner].txt,::eta]inner.txt]' master --update refs/josh/filtered 1> /dev/null
+  $ josh-filter -s ':exclude[::alpha@beta.txt,::gamma+(1).txt,::zeta[inner].txt,::"eta]inner.txt"]' master --update refs/josh/filtered 1> /dev/null
 
   $ git ls-tree --name-only -r refs/josh/filtered
   keep.txt
