@@ -5,7 +5,7 @@ use itertools::Itertools;
 use pest::Parser;
 use std::path::Path;
 
-use crate::filter::op::{LazyRef, Op};
+use crate::filter::op::{HashableRegex, LazyRef, Op};
 use crate::filter::opt;
 
 fn make_filter(args: &[&str]) -> JoshResult<Filter> {
@@ -154,7 +154,7 @@ fn parse_item(pair: pest::iterators::Pair<Rule>) -> JoshResult<Filter> {
                 regex::Regex::new(&unquote(r.as_str()))
                     .map_err(|e| josh_error(&format!("invalid regex: {}", e)))?
             } else {
-                crate::filter::MESSAGE_MATCH_ALL_REGEX.clone()
+                crate::filter::MESSAGE_MATCH_ALL_REGEX.0.clone()
             };
             Ok(f.message_regex(fmt, regex))
         }
@@ -225,11 +225,13 @@ fn parse_item(pair: pest::iterators::Pair<Rule>) -> JoshResult<Filter> {
             }
         }
         Rule::filter_replace => {
-            let replacements = pair
+            let replacements: Vec<(HashableRegex, String)> = pair
                 .into_inner()
                 .map(|x| unquote(x.as_str()))
                 .tuples()
-                .map(|(regex, replacement)| Ok((regex::Regex::new(&regex)?, replacement)))
+                .map(|(regex, replacement)| {
+                    Ok((HashableRegex(regex::Regex::new(&regex)?), replacement))
+                })
                 .collect::<JoshResult<_>>()?;
 
             Ok(to_filter(Op::RegexReplace(replacements)))
@@ -391,12 +393,41 @@ fn unquote(s: &str) -> String {
 // Encode string as json if it contains any chars reserved
 // by the filter language
 pub fn quote_if(s: &str) -> String {
-    if let Ok(r) = Grammar::parse(Rule::filter_path, s) {
-        if r.as_str() == s {
+    // Pest treats `WHITESPACE` as skippable between tokens, so a pure-grammar check is not enough
+    // to detect spaces inside a path. Spaces are reserved by the filter language and must be
+    // quoted to preserve round-trips and avoid ambiguity.
+    if s.chars().any(|c| c.is_whitespace()) {
+        return quote(s);
+    }
+
+    // Feature toggle:
+    // - With `fast_quote_if` (default): use a cheap character-class check aligned with grammar.
+    // - Without: use the slower Pest-based validation.
+
+    #[cfg(feature = "fast_quote_if")]
+    {
+        // Mirror `flang/grammar.pest`:
+        // PATH = (ALNUM | "/")+
+        // ALNUM = ( ASCII_ALPHANUMERIC | "_" | "-" | "+" | "." | "*" | "~" )
+        if !s.is_empty()
+            && s.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.' | '*' | '~' | '/')
+            })
+        {
             return s.to_string();
         }
+        quote(s)
     }
-    quote(s)
+
+    #[cfg(not(feature = "fast_quote_if"))]
+    {
+        if let Ok(r) = Grammar::parse(Rule::filter_path, s) {
+            if r.as_str() == s {
+                return s.to_string();
+            }
+        }
+        quote(s)
+    }
 }
 
 pub fn quote(s: &str) -> String {
