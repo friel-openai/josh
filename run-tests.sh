@@ -17,6 +17,12 @@ PATH="${TARGET_DIR}/debug/:${PATH}"
 PATH="$(pwd)/scripts/:${PATH}"
 export PATH
 
+export TZ=UTC
+
+export GIT_CONFIG_SYSTEM=/dev/null
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_ALLOW_PROTOCOL=file
+
 export JOSH_COMMIT_TIME=0
 export GIT_AUTHOR_NAME=Josh
 export GIT_AUTHOR_EMAIL=josh@example.com
