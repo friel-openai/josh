@@ -3,20 +3,13 @@ CMD_START = _{ ":" }
 CMT_START = _{ "#" }
 CMD_END = _{("="|"/")}
 CMD_SEP = _{(","|NEWLINE)}
-
-// NOTE: Command names must *not* accept group delimiters like `[`/`]`, otherwise `:exclude[...]`
-// can be mis-tokenized as a `filter_noarg` with cmd `exclude[`.
-CMD_ALNUM = _{( ASCII_ALPHANUMERIC | "_" | "-" | "+" | "." | "*" | "~" )}
-
-// NOTE: Paths are more permissive than commands. `]` remains reserved (group terminator) and must
-// be quoted via JSON-style strings.
-PATH_ALNUM = _{( CMD_ALNUM | "@" | "(" | ")" | "[" )}
+ALNUM = _{( ASCII_ALPHANUMERIC | "_" | "-" | "+" | "." | "*" | "~")}
 GROUP_START = _{ "[" }
 GROUP_END = _{ "]" }
-PATH = _{ (PATH_ALNUM | "/")+ }
+PATH = _{ (ALNUM | "/")+ }
 filter_path = { PATH }
 argument = { string | PATH }
-rev = { string | CMD_ALNUM+ }
+rev = { string | ALNUM+ }
 
 sstring = _{"\'" ~ inner ~ "\'"}
 dstring = _{"\"" ~ inner ~ "\""}
@@ -127,7 +120,7 @@ filter_meta = {
     ~ ")" ~ GROUP_START ~ compose ~ GROUP_END
 }
 
-cmd = { CMD_ALNUM+ }
+cmd = { ALNUM+ }
 
 file_entry = { dst_path ~ "=" ~ filter_spec }
 
@@ -153,4 +146,4 @@ workspace_file = {
 filter_chain = _{ filter_spec ~ EOI }
 
 dst_path = @{ path ~ ("/" ~ path)* }
-path = @{ PATH_ALNUM+ }
+path = @{ ALNUM+ }
