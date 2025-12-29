@@ -44,12 +44,21 @@ fn fixture() -> &'static RepoFixture {
 
         // Commit 1
         let mut index = repo.index().unwrap();
-        index.add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
         let tree1 = index.write_tree().unwrap();
         index.write().unwrap();
         let sig = git2::Signature::now("pin", "pin@example.com").unwrap();
         let commit1 = repo
-            .commit(Some("HEAD"), &sig, &sig, "c1", &repo.find_tree(tree1).unwrap(), &[])
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "c1",
+                &repo.find_tree(tree1).unwrap(),
+                &[],
+            )
             .unwrap();
 
         // Modify the files
@@ -58,7 +67,9 @@ fn fixture() -> &'static RepoFixture {
         }
 
         // Commit 2
-        index.add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
         let tree2 = index.write_tree().unwrap();
         index.write().unwrap();
         let commit2 = repo
@@ -85,7 +96,10 @@ fn fixture() -> &'static RepoFixture {
     })
 }
 
-fn open_tx(repo_gitdir: &std::path::Path, cache: std::sync::Arc<cache_stack::CacheStack>) -> cache::Transaction {
+fn open_tx(
+    repo_gitdir: &std::path::Path,
+    cache: std::sync::Arc<cache_stack::CacheStack>,
+) -> cache::Transaction {
     cache::TransactionContext::new(repo_gitdir, cache)
         .open(None)
         .expect("open tx")
@@ -116,8 +130,12 @@ fn bench_pin_apply(c: &mut Criterion) {
                 };
 
                 let commit = repo.find_commit(f.tip).expect("commit");
-                let out = filter::apply(&tx, stored_filter, filter::Apply::from_commit(&commit).unwrap())
-                    .expect("apply");
+                let out = filter::apply(
+                    &tx,
+                    stored_filter,
+                    filter::Apply::from_commit(&commit).unwrap(),
+                )
+                .expect("apply");
                 std::hint::black_box(out.tree().id());
 
                 if let Some(mempack) = mempack {

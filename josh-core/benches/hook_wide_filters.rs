@@ -59,10 +59,7 @@ fn fixture() -> &'static RepoFixture {
             cache_stack::CacheStack::new().with_backend(cache_sled::SledCacheBackend::default()),
         );
 
-        RepoFixture {
-            repo_gitdir,
-            cache,
-        }
+        RepoFixture { repo_gitdir, cache }
     })
 }
 
@@ -102,7 +99,11 @@ struct ParsingHook {
 }
 
 impl cache::FilterHook for ParsingHook {
-    fn filter_for_commit(&self, _commit_oid: git2::Oid, _arg: &str) -> josh_core::JoshResult<filter::Filter> {
+    fn filter_for_commit(
+        &self,
+        _commit_oid: git2::Oid,
+        _arg: &str,
+    ) -> josh_core::JoshResult<filter::Filter> {
         // Emulate Copyberry2-style behavior: build a filter per commit from a (very large) textual spec
         // and run the optimizer before returning.
         let parsed = filter::parse(&self.spec)?;
@@ -115,7 +116,11 @@ struct CachedHook {
 }
 
 impl cache::FilterHook for CachedHook {
-    fn filter_for_commit(&self, _commit_oid: git2::Oid, _arg: &str) -> josh_core::JoshResult<filter::Filter> {
+    fn filter_for_commit(
+        &self,
+        _commit_oid: git2::Oid,
+        _arg: &str,
+    ) -> josh_core::JoshResult<filter::Filter> {
         Ok(self.filter)
     }
 }
@@ -148,7 +153,8 @@ fn bench_hook_lookup_filter(c: &mut Criterion) {
 
     for &n in sizes.iter() {
         let spec = Arc::new(make_many_exclude_spec(n));
-        let cached_filter = filter::optimize(filter::parse(&spec).expect("parse cached wide exclude"));
+        let cached_filter =
+            filter::optimize(filter::parse(&spec).expect("parse cached wide exclude"));
 
         group.bench_function(BenchmarkId::new("parse_opt_each_call", n), |b| {
             b.iter_batched(
@@ -163,12 +169,12 @@ fn bench_hook_lookup_filter(c: &mut Criterion) {
                     for _ in 0..calls {
                         // The hook implementation ignores the commit oid, but use distinct values
                         // anyway to match the call pattern of real filtering runs.
-                        let oid = git2::Oid::hash_object(
-                            git2::ObjectType::Blob,
-                            hook_name.as_bytes(),
-                        )
-                        .expect("hash oid");
-                        let out = tx.lookup_filter_hook(&hook_name, oid).expect("lookup_filter_hook");
+                        let oid =
+                            git2::Oid::hash_object(git2::ObjectType::Blob, hook_name.as_bytes())
+                                .expect("hash oid");
+                        let out = tx
+                            .lookup_filter_hook(&hook_name, oid)
+                            .expect("lookup_filter_hook");
                         std::hint::black_box(out);
                     }
                 },
@@ -181,18 +187,21 @@ fn bench_hook_lookup_filter(c: &mut Criterion) {
                 || {
                     hook_seq = hook_seq.wrapping_add(1);
                     let hook_name = format!("wide_{hook_seq}");
-                    let tx = open_tx(&f.repo_gitdir, f.cache.clone())
-                        .with_filter_hook(Arc::new(CachedHook { filter: cached_filter }));
+                    let tx = open_tx(&f.repo_gitdir, f.cache.clone()).with_filter_hook(Arc::new(
+                        CachedHook {
+                            filter: cached_filter,
+                        },
+                    ));
                     (tx, hook_name)
                 },
                 |(tx, hook_name)| {
                     for _ in 0..calls {
-                        let oid = git2::Oid::hash_object(
-                            git2::ObjectType::Blob,
-                            hook_name.as_bytes(),
-                        )
-                        .expect("hash oid");
-                        let out = tx.lookup_filter_hook(&hook_name, oid).expect("lookup_filter_hook");
+                        let oid =
+                            git2::Oid::hash_object(git2::ObjectType::Blob, hook_name.as_bytes())
+                                .expect("hash oid");
+                        let out = tx
+                            .lookup_filter_hook(&hook_name, oid)
+                            .expect("lookup_filter_hook");
                         std::hint::black_box(out);
                     }
                 },

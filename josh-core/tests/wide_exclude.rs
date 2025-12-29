@@ -10,11 +10,7 @@ fn make_exclude_spec(n: usize, seed: u32) -> String {
             spec.push(',');
         }
         let dir = (i % 1024) as u32;
-        write!(
-            &mut spec,
-            "::dir{dir:04}/file_{seed:08}_{i:08}.txt"
-        )
-        .expect("write spec");
+        write!(&mut spec, "::dir{dir:04}/file_{seed:08}_{i:08}.txt").expect("write spec");
     }
     spec.push(']');
     spec
@@ -52,4 +48,3 @@ fn wide_exclude_roundtrip_spec_50k() {
     let reparsed = filter::parse(&roundtrip).expect("reparse wide exclude");
     assert_eq!(parsed, reparsed);
 }
-

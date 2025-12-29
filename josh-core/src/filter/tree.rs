@@ -1000,7 +1000,9 @@ impl MaskNode {
                 let rest = components.as_path();
                 let key = first.as_os_str().to_os_string();
 
-                let entry = children.entry(key).or_insert_with(|| MaskNode::Children(Default::default()));
+                let entry = children
+                    .entry(key)
+                    .or_insert_with(|| MaskNode::Children(Default::default()));
                 if rest.as_os_str().is_empty() {
                     *entry = MaskNode::Terminal;
                 } else {
