@@ -94,7 +94,7 @@ fn pretty2(op: &Op, indent: usize, compose: bool) -> String {
                     format!(
                         "{}{}:{}",
                         " ".repeat(indent),
-                        parse::quote(&regex.to_string()),
+                        parse::quote(regex.as_str()),
                         parse::quote(r)
                     )
                 })
@@ -181,7 +181,7 @@ pub(crate) fn spec2(op: &Op) -> String {
             let v = replacements
                 .iter()
                 .map(|(regex, r)| {
-                    format!("{}:{}", parse::quote(&regex.to_string()), parse::quote(r))
+                    format!("{}:{}", parse::quote(regex.as_str()), parse::quote(r))
                 })
                 .collect::<Vec<_>>();
             format!(":replace({})", v.join(","))

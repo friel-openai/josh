@@ -6,11 +6,15 @@ use std::sync::LazyLock;
 
 use crate::filter::hash::PassthroughHasher;
 use crate::filter::{Filter, LazyRef, Op, sequence_number};
+use crate::filter::op::HashableRegex;
 use crate::{JoshResult, josh_error};
 
 static FILTERS: LazyLock<
     std::sync::Mutex<HashMap<Filter, Op, BuildHasherDefault<PassthroughHasher>>>,
 > = LazyLock::new(|| Default::default());
+
+static OP_FILTERS: LazyLock<std::sync::Mutex<HashMap<Op, Filter>>> =
+    LazyLock::new(|| Default::default());
 
 pub(crate) fn peel_op(filter: Filter) -> Op {
     let op = to_op(filter);
@@ -169,7 +173,7 @@ impl InMemoryBuilder {
 
     fn build_regex_replace_params(
         &mut self,
-        replacements: &[(regex::Regex, String)],
+        replacements: &[(HashableRegex, String)],
     ) -> gix_hash::ObjectId {
         let mut outer_entries = Vec::new();
         for (i, (regex, replacement)) in replacements.iter().enumerate() {
@@ -393,11 +397,17 @@ impl InMemoryBuilder {
 }
 
 pub(crate) fn to_filter(op: Op) -> Filter {
+    let mut guard = OP_FILTERS.lock().unwrap();
+    if let Some(f) = guard.get(&op) {
+        return *f;
+    }
+
     let mut builder = InMemoryBuilder::new();
     let tree_id = builder.build_op(&op).unwrap();
     let oid = git2::Oid::from_bytes(tree_id.as_bytes()).unwrap();
 
     let f = Filter(oid);
+    guard.insert(op.clone(), f);
     FILTERS.lock().unwrap().insert(f, op);
     f
 }
@@ -599,7 +609,7 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> JoshResult<Op> {
             let regex_str = std::str::from_utf8(regex_blob.content())?;
             let regex = regex::Regex::new(regex_str)
                 .map_err(|e| josh_error(&format!("invalid regex: {}", e)))?;
-            Ok(Op::Message(fmt, regex))
+            Ok(Op::Message(fmt, HashableRegex(regex)))
         }
         "subdir" => {
             let inner = repo.find_tree(entry.id())?;
@@ -926,7 +936,7 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> JoshResult<Op> {
                 let regex_str = std::str::from_utf8(regex_blob.content())?;
                 let replacement = std::str::from_utf8(replacement_blob.content())?.to_string();
                 let regex = regex::Regex::new(regex_str)?;
-                replacements.push((regex, replacement));
+                replacements.push((HashableRegex(regex), replacement));
             }
             Ok(Op::RegexReplace(replacements))
         }
