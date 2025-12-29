@@ -5,7 +5,7 @@ use itertools::Itertools;
 use pest::Parser;
 use std::path::Path;
 
-use crate::filter::op::{HashableRegex, LazyRef, Op};
+use crate::filter::op::{LazyRef, Op};
 use crate::filter::opt;
 
 fn make_filter(args: &[&str]) -> JoshResult<Filter> {
@@ -153,14 +153,12 @@ fn parse_item(pair: pest::iterators::Pair<Rule>) -> JoshResult<Filter> {
             let mut inner = pair.into_inner();
             let fmt = unquote(inner.next().unwrap().as_str());
             let regex = if let Some(r) = inner.next() {
-                HashableRegex(
-                    regex::Regex::new(&unquote(r.as_str()))
-                        .map_err(|e| josh_error(&format!("invalid regex: {}", e)))?,
-                )
+                regex::Regex::new(&unquote(r.as_str()))
+                    .map_err(|e| josh_error(&format!("invalid regex: {}", e)))?
             } else {
                 crate::filter::MESSAGE_MATCH_ALL_REGEX.clone()
             };
-            Ok(f.chain(to_filter(Op::Message(fmt, regex))))
+            Ok(f.message_regex(fmt, regex))
         }
         Rule::filter_group => {
             let v: Vec<_> = pair.into_inner().map(|x| unquote(x.as_str())).collect();
@@ -233,7 +231,7 @@ fn parse_item(pair: pest::iterators::Pair<Rule>) -> JoshResult<Filter> {
                 .into_inner()
                 .map(|x| unquote(x.as_str()))
                 .tuples()
-                .map(|(regex, replacement)| Ok((HashableRegex(regex::Regex::new(&regex)?), replacement)))
+                .map(|(regex, replacement)| Ok((regex::Regex::new(&regex)?, replacement)))
                 .collect::<JoshResult<_>>()?;
 
             Ok(to_filter(Op::RegexReplace(replacements)))
@@ -395,53 +393,12 @@ fn unquote(s: &str) -> String {
 // Encode string as json if it contains any chars reserved
 // by the filter language
 pub fn quote_if(s: &str) -> String {
-    // Paths are printed in hot loops (spec/spec2). The original implementation relied on Pest to
-    // validate PATH grammar, which is expensive for very wide filters (50k+ paths).
-    //
-    // Keep a cheap, grammar-aligned check on the hot path and fall back to JSON quoting when the
-    // string contains any reserved characters.
-    //
-    // Feature toggle:
-    // - With `fast_quote_if` (default): use the fast character-class check.
-    // - Without: use the previous Pest-based validation.
-
-    // Pest treats `WHITESPACE` as skippable between tokens, so a pure-grammar check is not enough
-    // to detect spaces inside a path. Spaces are reserved by the filter language and must be
-    // quoted to preserve round-trips and avoid ambiguity.
-    if s.chars().any(|c| c.is_whitespace()) {
-        return quote(s);
-    }
-
-    #[cfg(feature = "fast_quote_if")]
-    {
-        // Mirror `filter/grammar.pest`:
-        // PATH = (PATH_ALNUM | "/")+
-        // PATH_ALNUM = ( ASCII_ALPHANUMERIC | "_" | "-" | "+" | "." | "*" | "~" | "@" | "(" | ")" | "[" )
-        //
-        // `]` remains reserved (group terminator) and must be quoted.
-        if !s.is_empty()
-            && s.chars().all(|c| {
-                c.is_ascii_alphanumeric()
-                    || matches!(
-                        c,
-                        '_' | '-' | '+' | '.' | '*' | '~' | '@' | '(' | ')' | '[' | '/'
-                    )
-            })
-        {
+    if let Ok(r) = Grammar::parse(Rule::filter_path, s) {
+        if r.as_str() == s {
             return s.to_string();
         }
-        return quote(s);
     }
-
-    #[cfg(not(feature = "fast_quote_if"))]
-    {
-        if let Ok(r) = Grammar::parse(Rule::filter_path, s) {
-            if r.as_str() == s {
-                return s.to_string();
-            }
-        }
-        quote(s)
-    }
+    quote(s)
 }
 
 pub fn quote(s: &str) -> String {
@@ -496,50 +453,3 @@ pub fn get_comments(filter_spec: &str) -> JoshResult<String> {
 #[derive(pest_derive::Parser)]
 #[grammar = "flang/grammar.pest"]
 struct Grammar;
-
-#[cfg(test)]
-mod grammar_tests {
-    use super::{Grammar, Rule};
-    use pest::Parser;
-
-    #[test]
-    fn path_handles_special_chars() {
-        let paths = [
-            "alpha@beta.txt",
-            "gamma+(1).txt",
-            "epsilon(inner).txt",
-            // `[` is supported unquoted, `]` is reserved by the filter language.
-            "zeta[inner.txt",
-        ];
-        for path in &paths {
-            Grammar::parse(Rule::path, path).unwrap_or_else(|_| panic!("failed for {path}"));
-        }
-    }
-
-    #[test]
-    fn filter_chain_handles_special_paths() {
-        // `@`, `+`, `(`, `)` and `[` should be accepted unquoted. `]` remains reserved and must be
-        // quoted.
-        let spec = r#":exclude[::alpha@beta.txt,::gamma+(1).txt,::zeta[inner.txt,::"zeta[inner].txt"]"#;
-        Grammar::parse(Rule::filter_chain, spec)
-            .expect("Grammar should parse special char exclude filter");
-    }
-
-    #[test]
-    fn quote_if_quotes_spaces() {
-        let quoted = super::quote_if("has space.txt");
-        assert_eq!(quoted, "\"has space.txt\"");
-
-        let spec = format!(":exclude[::{}]", quoted);
-        Grammar::parse(Rule::filter_chain, &spec).expect("quoted space path should parse");
-    }
-
-    #[test]
-    fn quote_if_quotes_close_bracket() {
-        let quoted = super::quote_if("close]bracket.txt");
-        assert_eq!(quoted, "\"close]bracket.txt\"");
-
-        let spec = format!(":exclude[::{}]", quoted);
-        Grammar::parse(Rule::filter_chain, &spec).expect("quoted `]` path should parse");
-    }
-}
