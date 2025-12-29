@@ -10,7 +10,7 @@ pub mod tree;
 
 use crate::flang::parse;
 
-use op::{LazyRef, Op};
+use op::{HashableRegex, LazyRef, Op};
 
 pub use persist::as_tree;
 pub use persist::from_tree;
@@ -61,8 +61,8 @@ static ANCESTORS: LazyLock<
 
 /// Match-all regex pattern used as the default for Op::Message when no regex is specified.
 /// The pattern `(?s)^.*$` matches any string (including newlines) from start to end.
-pub(crate) static MESSAGE_MATCH_ALL_REGEX: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new("(?s)^.*$").unwrap());
+pub(crate) static MESSAGE_MATCH_ALL_REGEX: LazyLock<HashableRegex> =
+    LazyLock::new(|| HashableRegex(regex::Regex::new("(?s)^.*$").unwrap()));
 
 /// Filters are represented as `git2::Oid`, however they are not ever stored
 /// inside the repo.
@@ -263,7 +263,7 @@ impl Filter {
 
     /// Chain a message filter that transforms commit messages
     pub fn message_regex(self, m: impl Into<String>, regex: regex::Regex) -> Filter {
-        self.chain(to_filter(Op::Message(m.into(), regex)))
+        self.chain(to_filter(Op::Message(m.into(), HashableRegex(regex))))
     }
 
     /// Chain a hook filter

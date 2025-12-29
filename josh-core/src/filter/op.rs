@@ -2,6 +2,31 @@ use super::Filter;
 use crate::JoshResult;
 use crate::josh_error;
 
+#[derive(Clone, Debug)]
+pub struct HashableRegex(pub regex::Regex);
+
+impl std::ops::Deref for HashableRegex {
+    type Target = regex::Regex;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::hash::Hash for HashableRegex {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_str().hash(state);
+    }
+}
+
+impl PartialEq for HashableRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for HashableRegex {}
+
 #[derive(Hash, Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub enum LazyRef {
     Resolved(git2::Oid),
@@ -31,7 +56,7 @@ impl LazyRef {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Op {
     Meta(std::collections::BTreeMap<String, String>, Filter),
 
@@ -63,7 +88,7 @@ pub enum Op {
     Prune,
     Unsign,
 
-    RegexReplace(Vec<(regex::Regex, String)>),
+    RegexReplace(Vec<(HashableRegex, String)>),
 
     Hook(String),
 
@@ -77,7 +102,7 @@ pub enum Op {
     Stored(std::path::PathBuf),
 
     Pattern(String),
-    Message(String, regex::Regex),
+    Message(String, HashableRegex),
 
     HistoryConcat(LazyRef, Filter),
     #[cfg(feature = "incubating")]
