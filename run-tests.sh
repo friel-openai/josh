@@ -21,7 +21,7 @@ export TZ=UTC
 
 export GIT_CONFIG_SYSTEM=/dev/null
 export GIT_CONFIG_GLOBAL=/dev/null
-export GIT_ALLOW_PROTOCOL=file
+export GIT_ALLOW_PROTOCOL=file:git:ssh:https:http
 
 export JOSH_COMMIT_TIME=0
 export GIT_AUTHOR_NAME=Josh
