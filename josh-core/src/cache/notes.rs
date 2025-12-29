@@ -63,8 +63,18 @@ impl CacheBackend for NotesCacheBackend {
         let key = filter.id();
 
         if let Ok(note) = repo.find_note(Some(&note_path(key, sequence_number)), from) {
-            let message = note.message().unwrap_or("");
-            let result = git2::Oid::from_str(message)?;
+            let message = note.message().unwrap_or("").trim();
+            let Ok(result) = git2::Oid::from_str(message) else {
+                // Corrupt / unexpected note content: treat as a cache miss.
+                return Ok(None);
+            };
+
+            // Notes may be fetched without the corresponding objects being present locally (e.g.
+            // partial fetches, stale notes, or corrupted entries). Treat such entries as cache
+            // misses so callers can recompute.
+            if repo.find_object(result, None).is_err() {
+                return Ok(None);
+            }
 
             Ok(Some(result))
         } else {
