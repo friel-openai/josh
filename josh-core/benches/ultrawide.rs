@@ -43,13 +43,9 @@ fn generate_filters() -> Vec<Filter> {
 
 fn ultrawide(c: &mut Criterion) {
     c.bench_function("ultrawide_filter_parse", |b| {
-        b.iter_with_setup_wrapper(|runner| {
-            let filter = generate_filters();
-
-            runner.run(move || {
-                let filter = josh_core::filter::compose(&filter);
-                std::hint::black_box(filter);
-            })
+        b.iter_with_setup(generate_filters, |filters| {
+            let filter = josh_core::filter::compose(&filters);
+            std::hint::black_box(filter);
         });
     });
 }

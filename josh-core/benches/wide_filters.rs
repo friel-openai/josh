@@ -169,20 +169,16 @@ fn bench_build_pin_exclude(c: &mut Criterion) {
 
     let mut seed: u32 = 150;
     for &n in sizes.iter() {
-        group.bench_with_input(
-            BenchmarkId::new("build_exclude_paths", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || {
-                        seed = seed.wrapping_add(1);
-                        mk_paths(n, seed)
-                    },
-                    |paths| std::hint::black_box(filter::exclude_paths(paths)),
-                    BatchSize::LargeInput,
-                )
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("build_exclude_paths", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    seed = seed.wrapping_add(1);
+                    mk_paths(n, seed)
+                },
+                |paths| std::hint::black_box(filter::exclude_paths(paths)),
+                BatchSize::LargeInput,
+            )
+        });
 
         group.bench_with_input(BenchmarkId::new("build_pin_paths", n), &n, |b, &n| {
             b.iter_batched(
@@ -220,17 +216,13 @@ fn bench_spec_exclude(c: &mut Criterion) {
     for &n in sizes.iter() {
         let spec = make_exclude_spec(&mk_paths(n, seed));
         seed = seed.wrapping_add(1);
-        group.bench_with_input(
-            BenchmarkId::new("spec_roundtrip", n),
-            &spec,
-            |b, spec| {
-                b.iter(|| {
-                    let parsed = filter::parse(spec).expect("parse");
-                    let optimized = filter::optimize(parsed);
-                    std::hint::black_box(filter::spec(optimized))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("spec_roundtrip", n), &spec, |b, spec| {
+            b.iter(|| {
+                let parsed = filter::parse(spec).expect("parse");
+                let optimized = filter::optimize(parsed);
+                std::hint::black_box(filter::spec(optimized))
+            })
+        });
     }
 
     group.finish();

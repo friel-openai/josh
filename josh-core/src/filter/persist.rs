@@ -5,8 +5,8 @@ use std::hash::BuildHasherDefault;
 use std::sync::LazyLock;
 
 use crate::filter::hash::PassthroughHasher;
-use crate::filter::{Filter, LazyRef, Op, sequence_number};
 use crate::filter::op::HashableRegex;
+use crate::filter::{Filter, LazyRef, Op, sequence_number};
 use crate::{JoshResult, josh_error};
 
 static FILTERS: LazyLock<

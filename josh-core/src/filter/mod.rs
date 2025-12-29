@@ -2542,18 +2542,23 @@ mod tests {
         // Josh transaction requires sled DB init.
         let gitdir = repo.path().to_path_buf();
         crate::cache::sled_load(&gitdir).expect("sled_load");
-        let cache = std::sync::Arc::new(crate::cache::CacheStack::new().with_backend(
-            crate::cache::SledCacheBackend::default(),
-        ));
+        let cache = std::sync::Arc::new(
+            crate::cache::CacheStack::new().with_backend(crate::cache::SledCacheBackend::default()),
+        );
         let tx = crate::cache::TransactionContext::new(&gitdir, cache)
             .open(None)
             .expect("open tx");
 
         // Build an exclude list that removes the first N paths.
-        let filters = paths.iter().take(n).cloned().map(crate::filter::file).collect();
-        let exclude = crate::filter::to_filter(crate::filter::Op::Exclude(crate::filter::to_filter(
-            crate::filter::Op::Compose(filters),
-        )));
+        let filters = paths
+            .iter()
+            .take(n)
+            .cloned()
+            .map(crate::filter::file)
+            .collect();
+        let exclude = crate::filter::to_filter(crate::filter::Op::Exclude(
+            crate::filter::to_filter(crate::filter::Op::Compose(filters)),
+        ));
         let exclude = crate::filter::opt::optimize(exclude);
 
         let commit = tx.repo().find_commit(commit_oid).expect("commit");
@@ -2565,6 +2570,9 @@ mod tests {
         let dt = start.elapsed();
         std::hint::black_box(out.tree().id());
 
-        println!("apply(:exclude[...{n}...]) on tree({file_count} files) => {:?}", dt);
+        println!(
+            "apply(:exclude[...{n}...]) on tree({file_count} files) => {:?}",
+            dt
+        );
     }
 }
