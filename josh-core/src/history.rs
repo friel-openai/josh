@@ -30,6 +30,7 @@ pub fn walk_many(
     walk.set_sorting(git2::Sort::REVERSE | git2::Sort::TOPOLOGICAL)?;
 
     let mut any_pushed = false;
+    let mut pushed_inputs = 0usize;
     for &input in inputs {
         if transaction.known(filter, input) {
             continue;
@@ -39,6 +40,7 @@ pub fn walk_many(
         }
         walk.push(input)?;
         any_pushed = true;
+        pushed_inputs += 1;
     }
 
     if !any_pushed {
@@ -49,8 +51,8 @@ pub fn walk_many(
     let walk = walk.with_hide_callback(&mut hide_callback)?;
 
     log::info!(
-        "Walking {} new commits for:\n{}\n",
-        0,
+        "Walking revwalk from {} input(s) for:\n{}\n",
+        pushed_inputs,
         filter::pretty(filter, 4),
     );
     let mut n_in = 0;

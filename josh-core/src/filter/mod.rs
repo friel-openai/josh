@@ -2205,11 +2205,36 @@ fn per_rev_filter(
     commit_filter: Filter,
     parent_filters: Vec<(git2::Commit, Filter)>,
 ) -> JoshResult<Option<git2::Oid>> {
+    // If the per-revision filter variation is *only* in `:pin[...]` contents, avoid creating a
+    // unique `Subtract(commit_filter, parent_filter)` for every parent edge. In large linear
+    // histories with per-commit pin growth (common in Copyberry2's "dag union" pin mode), that
+    // pattern can force Josh to populate caches for O(history) distinct subtract filters, leading
+    // to O(history²) work and cache write amplification.
+    //
+    // Correctness note: this optimization is only applied to linear (0/1-parent) commits. For
+    // merges, the legacy subtract behavior is preserved to avoid changing semantics when parents
+    // differ.
+    //
+    // `pin_details` below already implements the history-aware semantics for pin changes by
+    // overlaying masked content from filtered parents.
+    let can_optimize_pin_only_variation = commit.parent_count() <= 1;
+    let commit_filter_without_pin = if can_optimize_pin_only_variation {
+        Some(legalize_pin(commit_filter, &|_f| to_filter(Op::Nop)))
+    } else {
+        None
+    };
+
     // Compute the difference between the current commit's filter and each parent's filter.
     // This determines what new content should be contributed by that parent in the filtered history.
     let extra_parents = parent_filters
         .into_iter()
         .map(|(parent, pcw)| {
+            if let Some(commit_filter_without_pin) = commit_filter_without_pin {
+                let parent_filter_without_pin = legalize_pin(pcw, &|_f| to_filter(Op::Nop));
+                if parent_filter_without_pin == commit_filter_without_pin {
+                    return Ok(Some(git2::Oid::zero()));
+                }
+            }
             let f = opt::optimize(to_filter(Op::Subtract(commit_filter, pcw)));
             apply_to_commit2(f, &parent, transaction)
         })
