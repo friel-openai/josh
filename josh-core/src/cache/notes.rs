@@ -238,7 +238,7 @@ impl CacheBackend for NotesCacheBackendV24 {
         }
 
         let key = filter.id();
-        let signature = super::cache::josh_commit_signature()?;
+        let signature = super::transaction::josh_commit_signature()?;
 
         repo.note(
             &signature,

@@ -1,6 +1,5 @@
-use josh_core::cache::{CacheBackend, CacheStack, NotesCacheBackendV24};
-use josh_core::{JoshResult, filter};
-use std::sync::Mutex;
+use josh_core::cache::{CacheBackend, CacheStack, NotesCacheBackend, NotesCacheBackendV24};
+use josh_core::filter;
 
 fn write_commit(
     repo: &git2::Repository,
@@ -18,71 +17,6 @@ fn write_commit(
     let tree = repo.find_tree(tree_id).expect("tree");
     repo.commit(update_ref, &sig, &sig, message, &tree, parents)
         .expect("commit")
-}
-
-struct NotesCacheBackendV25Stub {
-    repo: Mutex<git2::Repository>,
-}
-
-impl NotesCacheBackendV25Stub {
-    fn new(repo_path: impl AsRef<std::path::Path>) -> JoshResult<Self> {
-        Ok(Self {
-            repo: Mutex::new(git2::Repository::open(repo_path.as_ref())?),
-        })
-    }
-
-    fn note_path_v25(key: git2::Oid, sequence_number: u128) -> String {
-        format!("refs/josh/25/{}/{}", sequence_number / 10000, key)
-    }
-}
-
-impl CacheBackend for NotesCacheBackendV25Stub {
-    fn read(
-        &self,
-        filter: josh_core::filter::Filter,
-        from: git2::Oid,
-        sequence_number: u128,
-    ) -> JoshResult<Option<git2::Oid>> {
-        if filter == filter::sequence_number() {
-            return Ok(None);
-        }
-        let repo = self.repo.lock().unwrap();
-        let key = filter.id();
-        let path = Self::note_path_v25(key, sequence_number);
-        if let Ok(note) = repo.find_note(Some(&path), from) {
-            let message = note.message().unwrap_or("").trim();
-            let Ok(result) = git2::Oid::from_str(message) else {
-                return Ok(None);
-            };
-            Ok(Some(result))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn write(
-        &self,
-        filter: josh_core::filter::Filter,
-        from: git2::Oid,
-        to: git2::Oid,
-        sequence_number: u128,
-    ) -> JoshResult<()> {
-        if filter == filter::sequence_number() {
-            return Ok(());
-        }
-        let repo = self.repo.lock().unwrap();
-        let sig = git2::Signature::now("test", "test@example.com")?;
-        let key = filter.id();
-        repo.note(
-            &sig,
-            &sig,
-            Some(&Self::note_path_v25(key, sequence_number)),
-            from,
-            &to.to_string(),
-            true,
-        )?;
-        Ok(())
-    }
 }
 
 #[test]
@@ -112,7 +46,7 @@ fn notes_cache_v24_can_backfill_v25_via_cache_stack_propagation() {
     CacheBackend::write(&v24, f, m_oid, m_oid, 0).expect("write v24 note");
 
     // Cache stack with v25 primary and v24 fallback.
-    let v25 = NotesCacheBackendV25Stub::new(repo.path()).expect("v25 stub");
+    let v25 = NotesCacheBackend::new(repo.path()).expect("v25 backend");
     let stack = CacheStack::new().with_backend(v25).with_backend(v24);
 
     // Use a sequence number representative of v25 semantics; the v24 backend ignores it and
@@ -129,4 +63,42 @@ fn notes_cache_v24_can_backfill_v25_via_cache_stack_propagation() {
     let path = format!("refs/josh/25/0/{}", key);
     let note = repo.find_note(Some(&path), m_oid).expect("v25 note");
     assert_eq!(note.message().unwrap_or("").trim(), m_oid.to_string());
+}
+
+#[test]
+fn notes_cache_stack_dual_write_writes_v24_and_v25() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = git2::Repository::init(tmp.path()).expect("init repo");
+
+    // Construct a merge commit so both backends will consider it eligible regardless of
+    // sequence number semantics.
+    let a_oid = write_commit(&repo, Some("HEAD"), "a", &[]);
+    let a = repo.find_commit(a_oid).expect("a");
+    let b_oid = write_commit(&repo, Some("HEAD"), "b", &[&a]);
+    let b = repo.find_commit(b_oid).expect("b");
+    let x_oid = write_commit(&repo, None, "x", &[&a]);
+    let x = repo.find_commit(x_oid).expect("x");
+    let m_oid = write_commit(&repo, Some("HEAD"), "m", &[&b, &x]);
+
+    let f = filter::parse(":/").expect("parse");
+
+    let v25 = NotesCacheBackend::new(repo.path()).expect("v25 backend");
+    let v24 = NotesCacheBackendV24::new(repo.path()).expect("v24 backend");
+    let stack = CacheStack::new().with_backend(v25).with_backend(v24);
+
+    // Sequence number representative of v25 semantics; the v24 backend computes its own.
+    stack
+        .write_all(f, m_oid, m_oid, 1)
+        .expect("write_all");
+
+    let key = f.id();
+    let note_v25 = repo
+        .find_note(Some(&format!("refs/josh/25/0/{}", key)), m_oid)
+        .expect("v25 note");
+    assert_eq!(note_v25.message().unwrap_or("").trim(), m_oid.to_string());
+
+    let note_v24 = repo
+        .find_note(Some(&format!("refs/josh/24/0/{}", key)), m_oid)
+        .expect("v24 note");
+    assert_eq!(note_v24.message().unwrap_or("").trim(), m_oid.to_string());
 }

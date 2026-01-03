@@ -199,7 +199,12 @@ fn run_filter(args: Vec<String>) -> josh_core::JoshResult<i32> {
             .with_backend(josh_core::cache::SledCacheBackend::default());
 
         if args.get_flag("notes-cache") {
-            cache.with_backend(josh_core::cache::NotesCacheBackend::new(&repo_path)?)
+            cache
+                // Primary (v25): uses current sequence number semantics and namespace.
+                .with_backend(josh_core::cache::NotesCacheBackend::new(&repo_path)?)
+                // Legacy (v24): continues reading/writing the old namespace using v24
+                // first-parent sequence numbers so upgrades don't lose warm caches.
+                .with_backend(josh_core::cache::NotesCacheBackendV24::new(&repo_path)?)
         } else {
             cache
         }
