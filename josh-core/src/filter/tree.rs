@@ -11,7 +11,9 @@ pub fn pathstree<'a>(
 ) -> JoshResult<git2::Tree<'a>> {
     let repo = transaction.repo();
     if let Some(cached) = transaction.get_paths((input, root.to_string())) {
-        return Ok(repo.find_tree(cached)?);
+        if let Ok(tree) = repo.find_tree(cached) {
+            return Ok(tree);
+        }
     }
 
     let tree = repo.find_tree(input)?;
@@ -103,7 +105,9 @@ pub fn remove_pred<'a>(
 ) -> JoshResult<git2::Tree<'a>> {
     let repo = transaction.repo();
     if let Some(cached) = transaction.get_glob((input, key)) {
-        return Ok(repo.find_tree(cached)?);
+        if let Ok(tree) = repo.find_tree(cached) {
+            return Ok(tree);
+        }
     }
     rs_tracing::trace_scoped!("remove_pred X", "root": root);
 
@@ -451,7 +455,9 @@ pub fn trigram_index<'a>(
 ) -> JoshResult<git2::Tree<'a>> {
     let repo = transaction.repo();
     if let Some(cached) = transaction.get_trigram_index(tree.id()) {
-        return Ok(repo.find_tree(cached)?);
+        if let Ok(tree) = repo.find_tree(cached) {
+            return Ok(tree);
+        }
     }
 
     let mut arrs_own = vec![vec![]; 8];
@@ -818,7 +824,9 @@ pub fn invert_paths<'a>(
 ) -> JoshResult<git2::Tree<'a>> {
     let repo = transaction.repo();
     if let Some(cached) = transaction.get_invert((tree.id(), root.to_string())) {
-        return Ok(repo.find_tree(cached)?);
+        if let Ok(tree) = repo.find_tree(cached) {
+            return Ok(tree);
+        }
     }
 
     let mut result = empty(repo);
