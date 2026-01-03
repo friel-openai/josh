@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 #[derive(Default)]
 struct CountingInner {
@@ -147,6 +148,38 @@ fn run_apply_and_count(
     counting.count()
 }
 
+fn parse_sizes_env(var: &str, default: &[usize]) -> Vec<usize> {
+    let raw = std::env::var(var).ok();
+    let mut sizes = Vec::new();
+    if let Some(raw) = raw {
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Ok(v) = part.parse::<usize>() {
+                if v > 0 {
+                    sizes.push(v);
+                }
+            }
+        }
+    }
+    if sizes.is_empty() {
+        sizes = default.to_vec();
+    }
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+fn parse_usize_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 #[test]
 fn varying_pin_hook_does_not_explode_cache_writes() {
     // This is intentionally small to keep the test fast while still exposing
@@ -190,4 +223,93 @@ fn varying_pin_hook_does_not_explode_cache_writes() {
         varying_writes <= static_writes.saturating_mul(10),
         "cache write explosion: varying={varying_writes} static={static_writes}"
     );
+}
+
+#[test]
+#[ignore]
+fn varying_pin_hook_scaling_one_shot() {
+    // Manual perf probe for Copyberry2-like "dag union" per-commit pin growth.
+    //
+    // Run:
+    //   cd third-party/josh/josh-core
+    //   JOSH_VARY_PIN_SCALING_FILES=5000,10000,15000 JOSH_VARY_PIN_SCALING_COMMITS=80 \
+    //     cargo test -q --test varying_pin_hook_cache_writes -- --ignored --nocapture
+    ensure_sled_loaded();
+    let sizes = parse_sizes_env(
+        "JOSH_VARY_PIN_SCALING_FILES",
+        &[5_000usize, 10_000usize, 15_000usize],
+    );
+    let commit_count = parse_usize_env("JOSH_VARY_PIN_SCALING_COMMITS", 80);
+
+    for &max_pins in &sizes {
+        let (_tmp, repo_gitdir, commits) = init_linear_repo(commit_count);
+        let tip = *commits.last().expect("tip");
+
+        let paths = make_paths(max_pins);
+
+        // Map commit oid -> index.
+        let mut oid_to_idx = HashMap::with_capacity(commits.len());
+        for (idx, oid) in commits.iter().enumerate() {
+            oid_to_idx.insert(*oid, idx);
+        }
+
+        // Precompute per-commit filters so the callback itself doesn't dominate.
+        let precompute_start = Instant::now();
+        let mut filters_by_idx = Vec::with_capacity(commits.len());
+        for idx in 0..commits.len() {
+            let pin_len = std::cmp::min(max_pins, 1 + (idx * max_pins) / commits.len().max(1));
+            let pins = filter::pin_paths(paths[..pin_len].iter().cloned());
+            filters_by_idx.push(filter::Filter::new().chain(pins).chain(filter::sequence_number()));
+        }
+        let precompute_elapsed = precompute_start.elapsed();
+
+        struct PrecomputedDagUnionHook {
+            oid_to_idx: HashMap<git2::Oid, usize>,
+            filters_by_idx: Vec<filter::Filter>,
+        }
+
+        impl cache::FilterHook for PrecomputedDagUnionHook {
+            fn filter_for_commit(
+                &self,
+                commit_oid: git2::Oid,
+                _arg: &str,
+            ) -> josh_core::JoshResult<filter::Filter> {
+                let idx = *self
+                    .oid_to_idx
+                    .get(&commit_oid)
+                    .ok_or_else(|| josh_core::josh_error("missing commit idx"))?;
+                Ok(self.filters_by_idx[idx])
+            }
+        }
+
+        let hook: Arc<dyn cache::FilterHook + Send + Sync> = Arc::new(PrecomputedDagUnionHook {
+            oid_to_idx,
+            filters_by_idx,
+        });
+
+        let counting = CountingCacheBackend::default();
+        let notes = cache::NotesCacheBackend::new(&repo_gitdir).expect("notes backend");
+        let cache_stack = Arc::new(
+            cache::CacheStack::new()
+                .with_backend(counting.clone())
+                .with_backend(notes),
+        );
+        let tx = open_tx(&repo_gitdir, cache_stack).with_filter_hook(hook);
+        let commit = tx.repo().find_commit(tip).expect("tip commit");
+        let hook_filter = filter::hook("varypin");
+
+        let start = Instant::now();
+        let _ = filter::apply_to_commit(hook_filter, &commit, &tx).expect("apply_to_commit");
+        let apply_elapsed = start.elapsed();
+        let writes = counting.count();
+
+        eprintln!(
+            "varying_pin_scaling max_pins={} commits={} precompute_ms={} apply_ms={} cache_writes={}",
+            max_pins,
+            commit_count,
+            precompute_elapsed.as_millis(),
+            apply_elapsed.as_millis(),
+            writes
+        );
+    }
 }
