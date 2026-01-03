@@ -1,3 +1,5 @@
+#![cfg(feature = "bench")]
+
 use josh_core::{cache, filter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -120,7 +122,7 @@ fn pretty_duration(d: Duration) -> String {
 #[ignore]
 fn pin_filter_scaling() {
     // Run with:
-    //   cargo test -q --test pin_filter_scaling -- --ignored --nocapture
+    //   cargo test -q --features bench --test pin_filter_scaling -- --ignored --nocapture
     //
     // Optional env overrides:
     //   JOSH_PIN_SCALING_FILES=5000,10000,15000
@@ -143,12 +145,22 @@ fn pin_filter_scaling() {
 
     ensure_sled_loaded();
 
-    for &size in &sizes {
+    let mut unique_sizes = sizes;
+    unique_sizes.sort_unstable();
+    unique_sizes.dedup();
+
+    let max_size = *unique_sizes
+        .iter()
+        .max()
+        .expect("at least one pin size");
+    let paths = make_paths(max_size);
+    let (_tmp, repo_gitdir, tip) = init_repo(&paths, commit_count);
+
+    for &size in &unique_sizes {
         let n = size;
-        let paths = make_paths(n);
-        let (_tmp, repo_gitdir, tip) = init_repo(&paths, commit_count);
+        let pin_paths = &paths[..n.min(paths.len())];
         let f = filter::Filter::new()
-            .chain(filter::pin_paths(paths.iter().cloned()))
+            .chain(filter::pin_paths(pin_paths.iter().cloned()))
             .chain(filter::sequence_number());
 
         let tx = open_tx(&repo_gitdir);
@@ -166,10 +178,14 @@ fn pin_filter_scaling() {
         );
 
         // Compare with the :hook path (mimics Copyberry2's ComputedResolver calling Josh hooks).
+        // Use a fresh transaction to avoid mixing cache/missing state between paths.
         drop(commit);
-        let tx_hook = tx.with_filter_hook(Arc::new(StaticPinHook { filter: f }));
+        drop(tx);
+        let tx_hook_base = open_tx(&repo_gitdir);
+        let tx_hook = tx_hook_base.with_filter_hook(Arc::new(StaticPinHook { filter: f }));
         let commit = tx_hook.repo().find_commit(tip).expect("tip commit");
-        let hook_filter = filter::hook("varypin");
+        let hook_name = format!("pin_scaling_{n}");
+        let hook_filter = filter::hook(&hook_name);
         let start = Instant::now();
         let _ = filter::apply_to_commit(hook_filter, &commit, &tx_hook).expect("apply_to_commit");
         let elapsed = start.elapsed();
