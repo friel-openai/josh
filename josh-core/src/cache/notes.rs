@@ -2,6 +2,7 @@ use super::transaction::{CACHE_VERSION, CacheBackend};
 use crate::JoshResult;
 use crate::filter;
 use crate::filter::Filter;
+use std::collections::HashMap;
 
 pub struct NotesCacheBackend {
     repo: std::sync::Mutex<git2::Repository>,
@@ -105,6 +106,144 @@ impl CacheBackend for NotesCacheBackend {
             &signature,
             &signature,
             Some(&note_path(key, sequence_number)),
+            from,
+            &to.to_string(),
+            true,
+        )?;
+
+        Ok(())
+    }
+}
+
+/// Legacy notes cache backend for reading/writing Josh notes stored under cache version 24.
+///
+/// This is intended to support upgrades where the primary notes cache version and/or sequence
+/// number semantics change, while still being able to read and maintain the older cache.
+pub struct NotesCacheBackendV24 {
+    repo: std::sync::Mutex<git2::Repository>,
+    sequence_numbers: std::sync::Mutex<HashMap<git2::Oid, u128>>,
+}
+
+impl NotesCacheBackendV24 {
+    pub fn new(repo_path: impl AsRef<std::path::Path>) -> JoshResult<Self> {
+        let repo = git2::Repository::open(repo_path.as_ref())?;
+        Ok(Self {
+            repo: std::sync::Mutex::new(repo),
+            sequence_numbers: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn compute_sequence_number_v24(
+        repo: &git2::Repository,
+        sequence_numbers: &mut HashMap<git2::Oid, u128>,
+        input: git2::Oid,
+    ) -> Option<u128> {
+        if let Some(v) = sequence_numbers.get(&input) {
+            return Some(*v);
+        }
+
+        let mut chain = Vec::new();
+        let mut current = input;
+        let start_seq: u128;
+        loop {
+            if let Some(v) = sequence_numbers.get(&current) {
+                start_seq = v.saturating_add(1);
+                break;
+            }
+            chain.push(current);
+            let commit = repo.find_commit(current).ok()?;
+            if let Some(p) = commit.parent_ids().next() {
+                current = p;
+            } else {
+                // Root commit: v24 first-parent numbering starts at 1.
+                start_seq = 1;
+                break;
+            }
+        }
+
+        let mut seq = start_seq;
+        for oid in chain.iter().rev() {
+            sequence_numbers.insert(*oid, seq);
+            seq = seq.saturating_add(1);
+        }
+
+        sequence_numbers.get(&input).copied()
+    }
+
+    fn note_path_v24(key: git2::Oid, sequence_number: u128) -> String {
+        // Version 24 is the legacy namespace.
+        format!("refs/josh/24/{}/{}", sequence_number / 10000, key)
+    }
+}
+
+impl CacheBackend for NotesCacheBackendV24 {
+    fn read(
+        &self,
+        filter: Filter,
+        from: git2::Oid,
+        _sequence_number: u128,
+    ) -> JoshResult<Option<git2::Oid>> {
+        if filter == filter::sequence_number() {
+            return Ok(None);
+        }
+
+        let repo = self.repo.lock()?;
+        let mut seqs = self.sequence_numbers.lock()?;
+        let Some(sequence_number) = Self::compute_sequence_number_v24(&repo, &mut seqs, from) else {
+            return Ok(None);
+        };
+
+        if !is_note_eligible(&repo, from, sequence_number) {
+            return Ok(None);
+        }
+
+        let key = filter.id();
+        let path = Self::note_path_v24(key, sequence_number);
+
+        if let Ok(note) = repo.find_note(Some(&path), from) {
+            let message = note.message().unwrap_or("").trim();
+            let Ok(result) = git2::Oid::from_str(message) else {
+                return Ok(None);
+            };
+
+            if repo.find_object(result, None).is_err() {
+                return Ok(None);
+            }
+
+            Ok(Some(result))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn write(
+        &self,
+        filter: Filter,
+        from: git2::Oid,
+        to: git2::Oid,
+        _sequence_number: u128,
+    ) -> JoshResult<()> {
+        if filter == filter::sequence_number() {
+            return Ok(());
+        }
+
+        let repo = self.repo.lock()?;
+        let mut seqs = self.sequence_numbers.lock()?;
+        let Some(sequence_number) = Self::compute_sequence_number_v24(&repo, &mut seqs, from) else {
+            return Ok(());
+        };
+
+        if !is_note_eligible(&*repo, from, sequence_number) {
+            return Ok(());
+        }
+
+        let key = filter.id();
+        let signature = super::cache::josh_commit_signature()?;
+
+        repo.note(
+            &signature,
+            &signature,
+            Some(&Self::note_path_v24(key, sequence_number)),
             from,
             &to.to_string(),
             true,
