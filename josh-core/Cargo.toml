@@ -13,6 +13,10 @@ edition = "2024"
 name = "ultrawide"
 harness = false
 
+[[bench]]
+name = "pin_populate_wide"
+harness = false
+
 [dependencies]
 backtrace = "0.3.76"
 bitvec = "1.0.1"

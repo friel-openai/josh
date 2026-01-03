@@ -689,6 +689,21 @@ pub fn apply_to_commit(
         let filtered = apply_to_commit2(filter, commit, transaction)?;
 
         if let Some(id) = filtered {
+            // Ensure the exact "tip" mapping (commit -> filtered commit) is persisted into the
+            // notes cache so cold restarts don't have to walk down to a sparse cache hit and then
+            // re-filter a long suffix.
+            //
+            // This is a best-effort hint: it should never change filter output.
+            if std::env::var_os("JOSH_DISABLE_TIP_NOTES").is_none() {
+                if let Err(err) = crate::cache::notes::write_tip_mapping(
+                    transaction.repo(),
+                    filter,
+                    commit.id(),
+                    id,
+                ) {
+                    log::debug!("failed to write tip mapping note: {}", err.0);
+                }
+            }
             return Ok(id);
         }
 
@@ -2315,9 +2330,9 @@ fn per_rev_filter(
 
             let parent = transaction.repo().find_commit(parent)?;
 
-            let pin_overlay = tree::populate(
+            let pin_overlay = tree::populate_from_mask_tree(
                 transaction,
-                tree::pathstree("", pin_subtract.tree.id(), transaction)?.id(),
+                pin_subtract.tree.id(),
                 parent.tree_id(),
             )?;
 
@@ -2510,6 +2525,59 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn apply_to_commit_persists_tip_mapping_note() {
+        use std::path::Path;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workdir = tmp.path().join("repo");
+        std::fs::create_dir_all(&workdir).expect("mkdirs");
+        let repo = git2::Repository::init(&workdir).expect("init repo");
+
+        // Create a trivial commit.
+        std::fs::write(workdir.join("file.txt"), "content\n").expect("write file");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("file.txt")).expect("add file.txt");
+        index.write().expect("index write");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("tree");
+        let sig = git2::Signature::now("test", "test@example.com").expect("sig");
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "c1", &tree, &[])
+            .expect("commit");
+
+        // Josh transaction requires sled DB init.
+        let repo_gitdir = repo.path().to_path_buf();
+        crate::cache::sled_load(&repo_gitdir).expect("sled_load");
+        let cache = std::sync::Arc::new(crate::cache::CacheStack::default());
+        let tx = crate::cache::TransactionContext::new(&repo_gitdir, cache)
+            .open(None)
+            .expect("open tx");
+
+        let commit = tx.repo().find_commit(commit_oid).expect("commit");
+
+        // Use a filter that returns the empty tree, producing the zero OID. This validates that we
+        // still persist a tip mapping even when the output commit object doesn't exist.
+        let filter = crate::filter::empty();
+        let filtered_oid = crate::filter::apply_to_commit(filter, &commit, &tx).expect("filter");
+        assert_eq!(filtered_oid, git2::Oid::zero());
+
+        let filter = crate::filter::opt::optimize(filter);
+        let tip_ref = format!(
+            "refs/josh/{}/tip/{}",
+            crate::cache::CACHE_VERSION,
+            filter.id()
+        );
+        let note = tx
+            .repo()
+            .find_note(Some(&tip_ref), commit_oid)
+            .expect("tip note exists");
+        assert_eq!(
+            note.message().unwrap_or("").trim(),
+            git2::Oid::zero().to_string()
+        );
     }
 
     fn make_many_file_filters(n: usize, seed: u32) -> Vec<Filter> {

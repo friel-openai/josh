@@ -15,10 +15,11 @@ pub fn pathstree<'a>(
     }
 
     let tree = repo.find_tree(input)?;
-    let mut result = empty(repo);
+    let mut builder = repo.treebuilder(None)?;
 
     for entry in tree.iter() {
         let name = entry.name().ok_or_else(|| josh_error("no name"))?;
+
         if entry.kind() == Some(git2::ObjectType::Blob) {
             let path = normalize_path(&Path::new(root).join(name));
             let path_string = path.to_str().ok_or_else(|| josh_error("no name"))?;
@@ -31,30 +32,32 @@ pub fn pathstree<'a>(
             } else {
                 path_string.to_string()
             };
-            result = replace_child(
-                repo,
+
+            builder.insert(
                 Path::new(name),
                 repo.blob(file_contents.as_bytes())?,
                 0o0100644,
-                &result,
             )?;
         }
 
         if entry.kind() == Some(git2::ObjectType::Tree) {
-            let s = pathstree(
+            let child_tree_id = pathstree(
                 &format!("{}{}{}", root, if root.is_empty() { "" } else { "/" }, name),
                 entry.id(),
                 transaction,
             )?
             .id();
 
-            if s != empty_id() {
-                result = replace_child(repo, Path::new(name), s, 0o0040000, &result)?;
+            if child_tree_id != empty_id() {
+                builder.insert(Path::new(name), child_tree_id, 0o0040000)?;
             }
         }
     }
-    transaction.insert_paths((input, root.to_string()), result.id());
-    Ok(result)
+
+    let result_id = builder.write()?;
+    transaction.insert_paths((input, root.to_string()), result_id);
+
+    Ok(repo.find_tree(result_id)?)
 }
 
 pub fn regex_replace<'a>(
@@ -902,32 +905,151 @@ pub fn populate(
 
     let repo = transaction.repo();
 
-    let mut result_tree = empty_id();
-    if let (Ok(paths), Ok(content)) = (repo.find_blob(paths), repo.find_blob(content)) {
-        let ipath = pathline(std::str::from_utf8(paths.content())?)?;
-        result_tree = insert(
-            repo,
-            &repo.find_tree(result_tree)?,
-            Path::new(&ipath),
-            content.id(),
-            0o0100644,
-        )?
-        .id();
-    } else if let (Ok(paths), Ok(content)) = (repo.find_tree(paths), repo.find_tree(content)) {
-        for entry in content.iter() {
-            if let Some(e) = paths.get_name(entry.name().ok_or_else(|| josh_error("no name"))?) {
-                result_tree = overlay(
-                    transaction,
-                    result_tree,
-                    populate(transaction, e.id(), entry.id())?,
+    // Collect all (path -> (oid, mode)) pairs in one pass, then build the resulting tree
+    // with a single treebuilder per directory to avoid O(n^2) behavior for wide pin sets.
+    let mut entries: Vec<(std::path::PathBuf, git2::Oid, i32)> = Vec::new();
+
+    fn collect_entries(
+        repo: &git2::Repository,
+        paths: git2::Oid,
+        content: git2::Oid,
+        entries: &mut Vec<(std::path::PathBuf, git2::Oid, i32)>,
+    ) -> JoshResult<()> {
+        if let (Ok(paths_blob), Ok(content_blob)) = (repo.find_blob(paths), repo.find_blob(content))
+        {
+            let ipath = pathline(std::str::from_utf8(paths_blob.content())?)?;
+            entries.push((
+                std::path::PathBuf::from(ipath),
+                content_blob.id(),
+                0o0100644,
+            ));
+            return Ok(());
+        }
+
+        if let (Ok(paths_tree), Ok(content_tree)) = (repo.find_tree(paths), repo.find_tree(content))
+        {
+            for entry in content_tree.iter() {
+                let name = entry.name().ok_or_else(|| josh_error("no name"))?;
+                if let Some(p_entry) = paths_tree.get_name(name) {
+                    collect_entries(repo, p_entry.id(), entry.id(), entries)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    collect_entries(repo, paths, content, &mut entries)?;
+
+    // Fast path: nothing to populate
+    if entries.is_empty() {
+        transaction.insert_populate((paths, content), empty_id());
+        return Ok(empty_id());
+    }
+
+    #[derive(Default)]
+    struct PopulateNode {
+        children: std::collections::BTreeMap<std::ffi::OsString, PopulateEntry>,
+    }
+
+    enum PopulateEntry {
+        Leaf { oid: git2::Oid, mode: i32 },
+        Dir(PopulateNode),
+    }
+
+    impl PopulateNode {
+        fn insert(&mut self, path: &Path, oid: git2::Oid, mode: i32) {
+            let mut components = path.components();
+            if let Some(first) = components.next() {
+                let name = first.as_os_str().to_os_string();
+                match components.as_path().as_os_str().is_empty() {
+                    true => {
+                        self.children
+                            .insert(name, PopulateEntry::Leaf { oid, mode });
+                    }
+                    false => {
+                        let entry = self
+                            .children
+                            .entry(name)
+                            .or_insert_with(|| PopulateEntry::Dir(PopulateNode::default()));
+                        if let PopulateEntry::Dir(dir) = entry {
+                            dir.insert(components.as_path(), oid, mode);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_node(repo: &git2::Repository, node: &PopulateNode) -> JoshResult<git2::Oid> {
+        let mut builder = repo.treebuilder(None)?;
+        for (name, entry) in &node.children {
+            match entry {
+                PopulateEntry::Leaf { oid, mode } => {
+                    builder.insert(Path::new(name), *oid, *mode)?;
+                }
+                PopulateEntry::Dir(dir) => {
+                    let child_id = write_node(repo, dir)?;
+                    builder.insert(Path::new(name), child_id, git2::FileMode::Tree.into())?;
+                }
+            }
+        }
+        Ok(builder.write()?)
+    }
+
+    let mut root = PopulateNode::default();
+    for (path, oid, mode) in entries {
+        root.insert(&path, oid, mode);
+    }
+
+    let result_tree = write_node(repo, &root)?;
+
+    transaction.insert_populate((paths, content), result_tree);
+
+    Ok(result_tree)
+}
+
+/// Build a tree by selecting entries from `content` using `mask` as a structural guide.
+///
+/// This is used by the `:pin` history semantics: we want to take the pinned paths from the
+/// filtered parent tree without constructing an intermediate `:paths` representation.
+pub fn populate_from_mask_tree(
+    transaction: &cache::Transaction,
+    mask: git2::Oid,
+    content: git2::Oid,
+) -> JoshResult<git2::Oid> {
+    rs_tracing::trace_scoped!("populate_from_mask_tree");
+
+    let repo = transaction.repo();
+    let (Ok(mask), Ok(content)) = (repo.find_tree(mask), repo.find_tree(content)) else {
+        return Ok(empty_id());
+    };
+
+    let mut builder = repo.treebuilder(None)?;
+    for entry in mask.iter() {
+        let name = entry.name().ok_or_else(|| josh_error("no name"))?;
+        let Some(content_entry) = content.get_name(name) else {
+            continue;
+        };
+
+        match (entry.kind(), content_entry.kind()) {
+            (Some(git2::ObjectType::Tree), Some(git2::ObjectType::Tree)) => {
+                let child = populate_from_mask_tree(transaction, entry.id(), content_entry.id())?;
+                if child != empty_id() {
+                    builder.insert(Path::new(name), child, git2::FileMode::Tree.into())?;
+                }
+            }
+            // For blobs (and any other non-tree entries), just take the content entry.
+            _ => {
+                builder.insert(
+                    Path::new(name),
+                    content_entry.id(),
+                    content_entry.filemode(),
                 )?;
             }
         }
     }
 
-    transaction.insert_populate((paths, content), result_tree);
-
-    Ok(result_tree)
+    Ok(builder.write()?)
 }
 
 pub fn compose_fast(
@@ -1088,4 +1210,58 @@ pub fn empty_id() -> git2::Oid {
 
 pub fn empty(repo: &git2::Repository) -> git2::Tree<'_> {
     repo.find_tree(empty_id()).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn populate_roundtrips_tree_for_many_files() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workdir = tmp.path().join("repo");
+        std::fs::create_dir_all(&workdir).expect("mkdirs");
+        let repo = git2::Repository::init(&workdir).expect("init repo");
+
+        let file_count = 1_000usize;
+        for i in 0..file_count {
+            let dir = (i % 256) as u32;
+            let p = PathBuf::from(format!("dir{dir:03}/file_{i:06}.txt"));
+            let abspath = workdir.join(&p);
+            std::fs::create_dir_all(abspath.parent().expect("parent")).expect("mkdirs");
+            std::fs::write(&abspath, format!("v{i}\n")).expect("write file");
+        }
+
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .expect("index add_all");
+        let tree_id = index.write_tree().expect("write tree");
+        index.write().expect("index write");
+        let tree = repo.find_tree(tree_id).expect("tree");
+        let sig = git2::Signature::now("test", "test@example.com").expect("sig");
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "c1", &tree, &[])
+            .expect("commit");
+
+        // Josh transaction requires sled DB init.
+        let repo_gitdir = repo.path().to_path_buf();
+        crate::cache::sled_load(&repo_gitdir).expect("sled_load");
+        let cache = std::sync::Arc::new(crate::cache::CacheStack::default());
+        let tx = crate::cache::TransactionContext::new(&repo_gitdir, cache)
+            .open(None)
+            .expect("open tx");
+
+        let commit = tx.repo().find_commit(commit_oid).expect("commit");
+        let content_tree = commit.tree_id();
+
+        let paths_tree = pathstree("", content_tree, &tx).expect("pathstree");
+        let repopulated = populate(&tx, paths_tree.id(), content_tree).expect("populate");
+        assert_eq!(repopulated, content_tree);
+
+        let selected =
+            populate_from_mask_tree(&tx, content_tree, content_tree).expect("populate_from_mask");
+        assert_eq!(selected, content_tree);
+    }
 }
