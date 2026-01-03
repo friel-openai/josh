@@ -254,7 +254,22 @@ impl Transaction {
         let x = git2::Oid::hash_object(git2::ObjectType::Blob, s.as_bytes()).expect("hash_object");
 
         if let Some(oid) = t2.path_tree.get(x.as_bytes()).unwrap() {
-            return Some(git2::Oid::from_bytes(&oid).unwrap());
+            let oid = git2::Oid::from_bytes(&oid).unwrap();
+
+            // The persistent sled caches can outlive the corresponding git objects (e.g. after
+            // `git gc` prunes unreachable derived trees). Treat missing objects as cache misses so
+            // the caller recomputes, and delete the stale entry to self-heal the cache.
+            if oid != git2::Oid::zero()
+                && self
+                    .repo
+                    .odb()
+                    .ok()
+                    .map(|odb| odb.exists(oid))
+                    .unwrap_or(false)
+            {
+                return Some(oid);
+            }
+            let _ = t2.path_tree.remove(x.as_bytes());
         }
         None
     }
@@ -274,7 +289,18 @@ impl Transaction {
         let x = git2::Oid::hash_object(git2::ObjectType::Blob, s.as_bytes()).expect("hash_object");
 
         if let Some(oid) = t2.invert_tree.get(x.as_bytes()).unwrap() {
-            return Some(git2::Oid::from_bytes(&oid).unwrap());
+            let oid = git2::Oid::from_bytes(&oid).unwrap();
+            if oid != git2::Oid::zero()
+                && self
+                    .repo
+                    .odb()
+                    .ok()
+                    .map(|odb| odb.exists(oid))
+                    .unwrap_or(false)
+            {
+                return Some(oid);
+            }
+            let _ = t2.invert_tree.remove(x.as_bytes());
         }
         None
     }
@@ -290,7 +316,18 @@ impl Transaction {
         let t2 = self.t2.borrow();
 
         if let Some(oid) = t2.trigram_index_tree.get(tree.as_bytes()).unwrap() {
-            return Some(git2::Oid::from_bytes(&oid).unwrap());
+            let oid = git2::Oid::from_bytes(&oid).unwrap();
+            if oid != git2::Oid::zero()
+                && self
+                    .repo
+                    .odb()
+                    .ok()
+                    .map(|odb| odb.exists(oid))
+                    .unwrap_or(false)
+            {
+                return Some(oid);
+            }
+            let _ = t2.trigram_index_tree.remove(tree.as_bytes());
         }
         None
     }
@@ -514,5 +551,71 @@ pub fn compute_sequence_number(
         Ok(u128_from_oid(count))
     } else {
         Err(crate::josh_error("missing sequence_number"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cache;
+    use crate::cache::CacheStack;
+    use tempfile::TempDir;
+
+    fn open_tx(repo_gitdir: &std::path::Path) -> cache::Transaction {
+        cache::sled_load(repo_gitdir).expect("sled_load");
+        let cache = std::sync::Arc::new(CacheStack::default());
+        cache::TransactionContext::new(repo_gitdir, cache)
+            .open(None)
+            .expect("open tx")
+    }
+
+    #[test]
+    fn sled_tree_caches_ignore_missing_objects() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let repo = git2::Repository::init(tmp.path()).expect("init repo");
+        let tx = open_tx(repo.path());
+
+        let missing = git2::Oid::hash_object(git2::ObjectType::Blob, b"definitely-missing")
+            .expect("hash_object");
+        assert!(!tx.repo().odb().expect("odb").exists(missing));
+
+        let key = (git2::Oid::zero(), "k".to_string());
+
+        // paths cache
+        tx.insert_paths(key.clone(), missing);
+        assert_eq!(tx.get_paths(key.clone()), None);
+        let x = git2::Oid::hash_object(git2::ObjectType::Blob, format!("{:?}", key).as_bytes())
+            .expect("hash_object");
+        assert!(
+            tx.t2
+                .borrow()
+                .path_tree
+                .get(x.as_bytes())
+                .expect("get")
+                .is_none()
+        );
+
+        // invert cache
+        tx.insert_invert(key.clone(), missing);
+        assert_eq!(tx.get_invert(key.clone()), None);
+        assert!(
+            tx.t2
+                .borrow()
+                .invert_tree
+                .get(x.as_bytes())
+                .expect("get")
+                .is_none()
+        );
+
+        // trigram index cache
+        tx.insert_trigram_index(git2::Oid::zero(), missing);
+        assert_eq!(tx.get_trigram_index(git2::Oid::zero()), None);
+        assert!(
+            tx.t2
+                .borrow()
+                .trigram_index_tree
+                .get(git2::Oid::zero().as_bytes())
+                .expect("get")
+                .is_none()
+        );
     }
 }
