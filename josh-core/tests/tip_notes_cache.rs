@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use git2::Repository;
 use josh_core::cache::{
-    sled_load, CacheBackend, CacheStack, NotesCacheBackend, TransactionContext,
+    compute_sequence_number, sled_load, CacheBackend, CacheStack, NotesCacheBackend,
+    TransactionContext,
 };
 use josh_core::filter;
 
-fn create_repo_with_initial_commit() -> (tempfile::TempDir, Repository, git2::Oid) {
+fn create_repo_with_two_commits() -> (tempfile::TempDir, Repository, git2::Oid, git2::Oid) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let repo = Repository::init(tmp.path()).expect("init repo");
     let sig = git2::Signature::now("test", "test@example.com").expect("signature");
@@ -28,12 +29,28 @@ fn create_repo_with_initial_commit() -> (tempfile::TempDir, Repository, git2::Oi
         .expect("commit");
     drop(tree);
 
-    (tmp, repo, commit)
+    std::fs::write(tmp.path().join("foo"), "hi2").expect("write foo2");
+    {
+        let mut idx = repo.index().expect("index");
+        idx.add_path(Path::new("foo")).expect("add foo");
+        idx.write().expect("write index");
+    }
+    let tree_oid = {
+        let mut idx = repo.index().expect("index");
+        idx.write_tree().expect("write tree")
+    };
+    let tree = repo.find_tree(tree_oid).expect("find tree");
+    let commit2 = repo
+        .commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&repo.find_commit(commit).unwrap()])
+        .expect("commit2");
+    drop(tree);
+
+    (tmp, repo, commit, commit2)
 }
 
 #[test]
-fn apply_to_commit_repairs_stale_tip_note_cache_entry() {
-    let (_tmp, repo, commit_oid) = create_repo_with_initial_commit();
+fn apply_to_commit_repairs_stale_forced_notes_cache_entry() {
+    let (_tmp, repo, _root_oid, commit_oid) = create_repo_with_two_commits();
     sled_load(repo.path()).expect("sled_load");
 
     let cache = Arc::new(CacheStack::default());
@@ -42,7 +59,8 @@ fn apply_to_commit_repairs_stale_tip_note_cache_entry() {
 
     let filterobj = filter::Filter::new();
     let filter_id = filterobj.id();
-    let tip_ref_v25 = format!("refs/josh/25/tip/{}", filter_id);
+    let seq25 = compute_sequence_number(&transaction, commit_oid).expect("sequence number");
+    let note_ref_v25 = format!("refs/josh/25/{}/{}", seq25 / 10000, filter_id);
 
     // Seed a stale entry pointing at a nonexistent object.
     let bogus = git2::Oid::from_bytes(&[0x13; 20]).expect("bogus oid");
@@ -50,12 +68,12 @@ fn apply_to_commit_repairs_stale_tip_note_cache_entry() {
     repo.note(
         &sig,
         &sig,
-        Some(&tip_ref_v25),
+        Some(&note_ref_v25),
         commit_oid,
         &bogus.to_string(),
         true,
     )
-    .expect("write bogus tip note");
+    .expect("write bogus note");
 
     let commit = transaction
         .repo()
@@ -65,30 +83,31 @@ fn apply_to_commit_repairs_stale_tip_note_cache_entry() {
     assert_eq!(out, commit_oid);
 
     let note = repo
-        .find_note(Some(&tip_ref_v25), commit_oid)
-        .expect("read tip note");
+        .find_note(Some(&note_ref_v25), commit_oid)
+        .expect("read v25 note");
     assert_eq!(note.message().unwrap_or("").trim(), commit_oid.to_string());
 
-    // Also writes to the legacy v24 tip namespace for dual-stack compatibility.
-    let tip_ref_v24 = format!("refs/josh/24/tip/{}", filter_id);
+    // Also writes to the legacy v24 namespace for dual-stack compatibility.
+    // In a linear history v24 first-parent numbering starts at 1, so the second commit is 2.
+    let note_ref_v24 = format!("refs/josh/24/0/{}", filter_id);
     let note = repo
-        .find_note(Some(&tip_ref_v24), commit_oid)
-        .expect("read v24 tip note");
+        .find_note(Some(&note_ref_v24), commit_oid)
+        .expect("read v24 note");
     assert_eq!(note.message().unwrap_or("").trim(), commit_oid.to_string());
 }
 
 #[test]
 fn notes_cache_backend_roundtrips_zero_oid() {
-    let (_tmp, repo, commit_oid) = create_repo_with_initial_commit();
+    let (_tmp, repo, root_oid, _head_oid) = create_repo_with_two_commits();
     let backend = NotesCacheBackend::new(repo.path()).expect("notes cache backend");
 
     // Root commits are always eligible (parent_count != 1), so sequence number doesn't matter here.
     backend
-        .write(filter::empty(), commit_oid, git2::Oid::zero(), 1)
+        .write(filter::empty(), root_oid, git2::Oid::zero(), 1)
         .expect("write");
 
     let out = backend
-        .read(filter::empty(), commit_oid, 1)
+        .read(filter::empty(), root_oid, 1)
         .expect("read")
         .expect("hit");
     assert_eq!(out, git2::Oid::zero());

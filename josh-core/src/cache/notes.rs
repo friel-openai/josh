@@ -6,6 +6,28 @@ use std::collections::HashMap;
 
 const LEGACY_CACHE_VERSION: u64 = 24;
 
+fn read_note_oid(repo: &git2::Repository, path: &str, from: git2::Oid) -> Option<git2::Oid> {
+    let note = repo.find_note(Some(path), from).ok()?;
+    let message = note.message().unwrap_or("").trim();
+    let Ok(result) = git2::Oid::from_str(message) else {
+        return None;
+    };
+
+    // `git2::Oid::zero()` is used as a sentinel for "filter produced no content".
+    if result == git2::Oid::zero() {
+        return Some(result);
+    }
+
+    // Notes may be fetched without the corresponding objects being present locally (e.g. partial
+    // fetches, stale notes, or corrupted entries). Treat such entries as cache misses so callers
+    // can recompute.
+    if repo.find_object(result, None).is_err() {
+        return None;
+    }
+
+    Some(result)
+}
+
 pub struct NotesCacheBackend {
     repo: std::sync::Mutex<git2::Repository>,
 }
@@ -48,70 +70,76 @@ fn note_path(key: git2::Oid, sequence_number: u128) -> String {
     )
 }
 
-fn tip_note_path(version: u64, key: git2::Oid) -> String {
-    format!("refs/josh/{}/tip/{}", version, key)
+fn note_path_v24(key: git2::Oid, sequence_number: u128) -> String {
+    // Version 24 is the legacy namespace.
+    format!(
+        "refs/josh/{}/{}/{}",
+        LEGACY_CACHE_VERSION,
+        sequence_number / 10000,
+        key,
+    )
 }
 
-fn read_tip_for_version(
-    repo: &git2::Repository,
-    version: u64,
-    key: git2::Oid,
-    from: git2::Oid,
-) -> Option<git2::Oid> {
-    let path = tip_note_path(version, key);
-    let note = repo.find_note(Some(&path), from).ok()?;
-    let message = note.message().unwrap_or("").trim();
-    let Ok(result) = git2::Oid::from_str(message) else {
-        return None;
-    };
-
-    // `git2::Oid::zero()` is used as a sentinel for "filter produced no content".
-    if result == git2::Oid::zero() {
-        return Some(result);
+fn compute_sequence_number_v24_uncached(repo: &git2::Repository, input: git2::Oid) -> Option<u128> {
+    // Root commit: v24 first-parent numbering starts at 1.
+    let mut depth: u128 = 1;
+    let mut current = input;
+    loop {
+        let commit = repo.find_commit(current).ok()?;
+        if let Some(parent) = commit.parent_ids().next() {
+            depth = depth.saturating_add(1);
+            current = parent;
+        } else {
+            break;
+        }
     }
-
-    // Notes may be fetched without the corresponding objects being present locally (e.g. partial
-    // fetches, stale notes, or corrupted entries). Treat such entries as cache misses so callers
-    // can recompute.
-    if repo.find_object(result, None).is_err() {
-        return None;
-    }
-
-    Some(result)
+    Some(depth)
 }
 
-pub(crate) fn read_tip(
+/// Read a "dense" cache entry from the normal sharded notes namespace, bypassing the normal
+/// sparseness eligibility gate. This is used to make repeated top-level filtering calls ~O(1)
+/// even with a sparse notes cache.
+pub(crate) fn read_forced(
     repo: &git2::Repository,
     key: git2::Oid,
     from: git2::Oid,
+    sequence_number: u128,
 ) -> Option<git2::Oid> {
-    read_tip_for_version(repo, CACHE_VERSION, key, from)
-        .or_else(|| read_tip_for_version(repo, LEGACY_CACHE_VERSION, key, from))
+    read_note_oid(repo, &note_path(key, sequence_number), from).or_else(|| {
+        let seq_v24 = compute_sequence_number_v24_uncached(repo, from)?;
+        read_note_oid(repo, &note_path_v24(key, seq_v24), from)
+    })
 }
 
-pub(crate) fn write_tip(
+/// Write a "dense" cache entry to the normal sharded notes namespace, bypassing the normal
+/// sparseness eligibility gate. Writes both the current and legacy version paths for
+/// dual-stack behavior.
+pub(crate) fn write_forced(
     repo: &git2::Repository,
     key: git2::Oid,
     from: git2::Oid,
     to: git2::Oid,
+    sequence_number: u128,
 ) -> JoshResult<()> {
     let signature = super::transaction::josh_commit_signature()?;
     repo.note(
         &signature,
         &signature,
-        Some(&tip_note_path(CACHE_VERSION, key)),
+        Some(&note_path(key, sequence_number)),
         from,
         &to.to_string(),
         true,
     )?;
-    repo.note(
-        &signature,
-        &signature,
-        Some(&tip_note_path(LEGACY_CACHE_VERSION, key)),
-        from,
-        &to.to_string(),
-        true,
-    )?;
+    if let Some(seq_v24) = compute_sequence_number_v24_uncached(repo, from) {
+        repo.note(
+            &signature,
+            &signature,
+            Some(&note_path_v24(key, seq_v24)),
+            from,
+            &to.to_string(),
+            true,
+        )?;
+    }
     Ok(())
 }
 
@@ -132,28 +160,7 @@ impl CacheBackend for NotesCacheBackend {
 
         let key = filter.id();
 
-        if let Ok(note) = repo.find_note(Some(&note_path(key, sequence_number)), from) {
-            let message = note.message().unwrap_or("").trim();
-            let Ok(result) = git2::Oid::from_str(message) else {
-                // Corrupt / unexpected note content: treat as a cache miss.
-                return Ok(None);
-            };
-
-            if result == git2::Oid::zero() {
-                return Ok(Some(result));
-            }
-
-            // Notes may be fetched without the corresponding objects being present locally (e.g.
-            // partial fetches, stale notes, or corrupted entries). Treat such entries as cache
-            // misses so callers can recompute.
-            if repo.find_object(result, None).is_err() {
-                return Ok(None);
-            }
-
-            Ok(Some(result))
-        } else {
-            Ok(None)
-        }
+        Ok(read_note_oid(&repo, &note_path(key, sequence_number), from))
     }
 
     fn write(
@@ -244,8 +251,7 @@ impl NotesCacheBackendV24 {
     }
 
     fn note_path_v24(key: git2::Oid, sequence_number: u128) -> String {
-        // Version 24 is the legacy namespace.
-        format!("refs/josh/24/{}/{}", sequence_number / 10000, key)
+        note_path_v24(key, sequence_number)
     }
 }
 
@@ -274,24 +280,7 @@ impl CacheBackend for NotesCacheBackendV24 {
         let key = filter.id();
         let path = Self::note_path_v24(key, sequence_number);
 
-        if let Ok(note) = repo.find_note(Some(&path), from) {
-            let message = note.message().unwrap_or("").trim();
-            let Ok(result) = git2::Oid::from_str(message) else {
-                return Ok(None);
-            };
-
-            if result == git2::Oid::zero() {
-                return Ok(Some(result));
-            }
-
-            if repo.find_object(result, None).is_err() {
-                return Ok(None);
-            }
-
-            Ok(Some(result))
-        } else {
-            Ok(None)
-        }
+        Ok(read_note_oid(&repo, &path, from))
     }
 
     fn write(

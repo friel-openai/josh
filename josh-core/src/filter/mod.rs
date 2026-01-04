@@ -685,23 +685,29 @@ pub fn apply_to_commit(
     transaction: &cache::Transaction,
 ) -> JoshResult<git2::Oid> {
     let filter = opt::optimize(filter);
-    if filter != sequence_number() {
+    let forced_sequence_number = if filter != sequence_number() {
         let repo = transaction.repo();
         let key = filter.id();
-        if let Some(cached) = crate::cache::notes::read_tip(repo, key, commit.id()) {
-            // Best-effort backfill/repair: if we can read a tip entry, ensure it's also written
-            // to the current cache version namespace.
-            let _ = crate::cache::notes::write_tip(repo, key, commit.id(), cached);
+        let sequence_number = cache::compute_sequence_number(transaction, commit.id())?;
+        if let Some(cached) =
+            crate::cache::notes::read_forced(repo, key, commit.id(), sequence_number)
+        {
             return Ok(cached);
         }
-    }
+        Some(sequence_number)
+    } else {
+        None
+    };
     loop {
         let filtered = apply_to_commit2(filter, commit, transaction)?;
 
         if let Some(id) = filtered {
-            if filter != sequence_number() {
+            if filter != sequence_number()
+                && let Some(sequence_number) = forced_sequence_number
+            {
                 let repo = transaction.repo();
-                let _ = crate::cache::notes::write_tip(repo, filter.id(), commit.id(), id);
+                let _ =
+                    crate::cache::notes::write_forced(repo, filter.id(), commit.id(), id, sequence_number);
             }
             return Ok(id);
         }
