@@ -1070,6 +1070,110 @@ pub fn mask_tree_from_paths(
     }
 }
 
+#[derive(Default)]
+struct SelectNode {
+    terminal: bool,
+    children: std::collections::BTreeMap<String, SelectNode>,
+}
+
+impl SelectNode {
+    fn insert(&mut self, path: &std::path::Path) -> Option<bool> {
+        if path.as_os_str().is_empty() {
+            self.terminal = true;
+            self.children.clear();
+            return Some(true);
+        }
+
+        let mut node = self;
+        for component in path.components() {
+            let comp = component.as_os_str().to_str()?;
+            node = node.children.entry(comp.to_string()).or_default();
+            if node.terminal {
+                // Parent path already selects the entire subtree; this insertion is redundant.
+                return Some(false);
+            }
+        }
+
+        if node.terminal {
+            return Some(false);
+        }
+
+        node.terminal = true;
+        node.children.clear();
+        Some(true)
+    }
+}
+
+/// Fast-path for composing many `::file` selections that do not remap paths (i.e. destination
+/// matches source).
+///
+/// This avoids `Tree::get_path` for each entry by traversing only the selected path components
+/// using `Tree::get_name` and building the output tree with treebuilders.
+pub fn compose_file_selections_no_remap<'a>(
+    transaction: &'a cache::Transaction,
+    full_tree: &git2::Tree<'a>,
+    paths: &[std::path::PathBuf],
+) -> JoshResult<Option<git2::Tree<'a>>> {
+    let repo = transaction.repo();
+
+    if paths.is_empty() {
+        return Ok(Some(empty(repo)));
+    }
+
+    let mut root = SelectNode::default();
+    for p in paths {
+        if root.insert(p).is_none() {
+            return Ok(None);
+        }
+        if root.terminal {
+            // Selecting the root yields the original tree.
+            return Ok(Some(full_tree.clone()));
+        }
+    }
+
+    fn build_subset(
+        repo: &git2::Repository,
+        full: &git2::Tree<'_>,
+        node: &SelectNode,
+    ) -> JoshResult<git2::Oid> {
+        let mut builder = repo.treebuilder(None)?;
+
+        for (name, child) in &node.children {
+            let Some(entry) = full.get_name(name) else {
+                continue;
+            };
+
+            if child.terminal {
+                builder.insert(std::path::Path::new(name), entry.id(), entry.filemode())?;
+                continue;
+            }
+
+            if child.children.is_empty() {
+                continue;
+            }
+
+            if entry.kind() != Some(git2::ObjectType::Tree) {
+                continue;
+            }
+
+            let subtree = repo.find_tree(entry.id())?;
+            let subtree_id = build_subset(repo, &subtree, child)?;
+            if subtree_id != empty_id() {
+                builder.insert(
+                    std::path::Path::new(name),
+                    subtree_id,
+                    git2::FileMode::Tree.into(),
+                )?;
+            }
+        }
+
+        Ok(builder.write()?)
+    }
+
+    let id = build_subset(repo, full_tree, &root)?;
+    Ok(Some(repo.find_tree(id)?))
+}
+
 pub fn get_blob(repo: &git2::Repository, tree: &git2::Tree, path: &Path) -> String {
     let entry_oid = ok_or!(tree.get_path(path).map(|x| x.id()), {
         return "".to_owned();

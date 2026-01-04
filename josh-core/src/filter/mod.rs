@@ -1783,6 +1783,31 @@ pub fn apply<'a>(
         Op::Stored(path) => apply(transaction, get_stored(transaction, x.tree(), path), x),
 
         Op::Compose(filters) => {
+            // Fast-path for very wide compositions of `::file` selections that don't remap paths.
+            // This pattern is common in Copyberry2's dynamic `:pin[...]` hooks with tens of
+            // thousands of pinned file paths.
+            if filters.len() >= 1024 {
+                let mut paths = Vec::with_capacity(filters.len());
+                let mut ok = true;
+                for f in filters {
+                    match to_op(*f) {
+                        Op::File(dest, src) if dest == src => paths.push(src),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if ok {
+                    if let Some(tree) =
+                        tree::compose_file_selections_no_remap(transaction, x.tree(), &paths)?
+                    {
+                        return Ok(x.with_tree(tree));
+                    }
+                }
+            }
+
             let filtered: Vec<_> = filters
                 .iter()
                 .map(|f| apply(transaction, *f, x.clone()))
