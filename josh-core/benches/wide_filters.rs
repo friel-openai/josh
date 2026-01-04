@@ -1,5 +1,6 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use josh_core::{cache, cache_sled, cache_stack, filter};
+use josh_core::{cache, filter};
+use josh_core::cache::{CacheStack, SledCacheBackend};
 use rs_tracing::trace_state_change;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::sync::OnceLock;
 struct RepoFixture {
     repo_gitdir: PathBuf,
     commit: git2::Oid,
-    cache: std::sync::Arc<cache_stack::CacheStack>,
+    cache: std::sync::Arc<CacheStack>,
     paths_1000: Vec<PathBuf>,
     paths_5000: Vec<PathBuf>,
 }
@@ -56,9 +57,9 @@ fn fixture() -> &'static RepoFixture {
         let repo_gitdir = repo.path().to_path_buf();
 
         // Josh transaction requires sled DB init.
-        cache_sled::sled_load(&repo_gitdir).expect("sled_load");
+        cache::sled_load(&repo_gitdir).expect("sled_load");
         let cache = std::sync::Arc::new(
-            cache_stack::CacheStack::new().with_backend(cache_sled::SledCacheBackend::default()),
+            CacheStack::new().with_backend(SledCacheBackend::default()),
         );
 
         RepoFixture {
@@ -71,10 +72,7 @@ fn fixture() -> &'static RepoFixture {
     })
 }
 
-fn open_tx(
-    repo_gitdir: &Path,
-    cache: std::sync::Arc<cache_stack::CacheStack>,
-) -> cache::Transaction {
+fn open_tx(repo_gitdir: &Path, cache: std::sync::Arc<CacheStack>) -> cache::Transaction {
     cache::TransactionContext::new(repo_gitdir, cache)
         .open(None)
         .expect("open tx")
@@ -264,8 +262,8 @@ fn bench_apply_exclude(c: &mut Criterion) {
                         let commit = repo.find_commit(f.commit).expect("commit");
                         let tree = commit.tree().expect("tree");
                         let start = std::time::Instant::now();
-                        let out = filter::apply(&tx, exclude, filter::Apply::from_tree(tree))
-                            .expect("apply");
+                let out = filter::apply(&tx, exclude, filter::Rewrite::from_tree(tree))
+                    .expect("apply");
                         std::hint::black_box(out.tree().id());
 
                         if let Some(mempack) = mempack {
@@ -293,7 +291,7 @@ fn bench_apply_exclude(c: &mut Criterion) {
 
                             let commit = repo.find_commit(f.commit).expect("commit");
                             let tree = commit.tree().expect("tree");
-                            let out = filter::apply(&tx, exclude, filter::Apply::from_tree(tree))
+                    let out = filter::apply(&tx, exclude, filter::Rewrite::from_tree(tree))
                                 .expect("apply");
                             std::hint::black_box(out.tree().id());
 

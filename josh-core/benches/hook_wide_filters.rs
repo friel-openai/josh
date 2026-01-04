@@ -1,11 +1,12 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use josh_core::{cache, cache_sled, cache_stack, filter};
+use josh_core::{cache, filter};
+use josh_core::cache::{CacheStack, SledCacheBackend};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 struct RepoFixture {
     repo_gitdir: PathBuf,
-    cache: Arc<cache_stack::CacheStack>,
+    cache: Arc<CacheStack>,
 }
 
 fn fixture() -> &'static RepoFixture {
@@ -54,16 +55,14 @@ fn fixture() -> &'static RepoFixture {
         let repo_gitdir = repo.path().to_path_buf();
 
         // Josh transaction requires sled DB init.
-        cache_sled::sled_load(&repo_gitdir).expect("sled_load");
-        let cache = Arc::new(
-            cache_stack::CacheStack::new().with_backend(cache_sled::SledCacheBackend::default()),
-        );
+        cache::sled_load(&repo_gitdir).expect("sled_load");
+        let cache = Arc::new(CacheStack::new().with_backend(SledCacheBackend::default()));
 
         RepoFixture { repo_gitdir, cache }
     })
 }
 
-fn open_tx(repo_gitdir: &Path, cache: Arc<cache_stack::CacheStack>) -> cache::Transaction {
+fn open_tx(repo_gitdir: &Path, cache: Arc<CacheStack>) -> cache::Transaction {
     cache::TransactionContext::new(repo_gitdir, cache)
         .open(None)
         .expect("open tx")

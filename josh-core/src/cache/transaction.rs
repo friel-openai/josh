@@ -6,6 +6,9 @@ use std::sync::{LazyLock, RwLock};
 
 pub(crate) const CACHE_VERSION: u64 = 25;
 
+#[cfg(feature = "tree_perf_opt")]
+const TREE_OP_CACHE_MAX_ENTRIES: usize = 200_000;
+
 pub trait CacheBackend: Send + Sync {
     fn read(
         &self,
@@ -97,6 +100,12 @@ struct Transaction2 {
     overlay_map: HashMap<(git2::Oid, git2::Oid), git2::Oid>,
     unapply_map: HashMap<git2::Oid, HashMap<git2::Oid, git2::Oid>>,
     legalize_map: HashMap<(crate::filter::Filter, git2::Oid), crate::filter::Filter>,
+    #[cfg(feature = "tree_perf_opt")]
+    tree_subset_cache: HashMap<(git2::Oid, git2::Oid), git2::Oid>,
+    #[cfg(feature = "tree_perf_opt")]
+    mask_tree_cache: HashMap<git2::Oid, git2::Oid>,
+    #[cfg(feature = "tree_perf_opt")]
+    mask_marker: Option<git2::Oid>,
 
     cache: std::sync::Arc<CacheStack>,
     path_tree: sled::Tree,
@@ -133,6 +142,12 @@ impl Transaction {
                 overlay_map: HashMap::new(),
                 unapply_map: HashMap::new(),
                 legalize_map: HashMap::new(),
+                #[cfg(feature = "tree_perf_opt")]
+                tree_subset_cache: HashMap::new(),
+                #[cfg(feature = "tree_perf_opt")]
+                mask_tree_cache: HashMap::new(),
+                #[cfg(feature = "tree_perf_opt")]
+                mask_marker: None,
                 cache,
                 path_tree,
                 invert_tree,
@@ -336,6 +351,79 @@ impl Transaction {
             return m.get(&from).cloned();
         }
         None
+    }
+
+    #[cfg(feature = "tree_perf_opt")]
+    pub fn get_tree_subset_cached(
+        &self,
+        tree: git2::Oid,
+        selection: git2::Oid,
+    ) -> Option<git2::Oid> {
+        self.t2
+            .borrow()
+            .tree_subset_cache
+            .get(&(tree, selection))
+            .copied()
+    }
+
+    #[cfg(not(feature = "tree_perf_opt"))]
+    pub fn get_tree_subset_cached(
+        &self,
+        _tree: git2::Oid,
+        _selection: git2::Oid,
+    ) -> Option<git2::Oid> {
+        None
+    }
+
+    #[cfg(feature = "tree_perf_opt")]
+    pub fn insert_tree_subset_cached(&self, tree: git2::Oid, selection: git2::Oid, out: git2::Oid) {
+        let mut t2 = self.t2.borrow_mut();
+        if t2.tree_subset_cache.len() > TREE_OP_CACHE_MAX_ENTRIES {
+            t2.tree_subset_cache.clear();
+        }
+        t2.tree_subset_cache.insert((tree, selection), out);
+    }
+
+    #[cfg(not(feature = "tree_perf_opt"))]
+    pub fn insert_tree_subset_cached(&self, _tree: git2::Oid, _selection: git2::Oid, _out: git2::Oid) {}
+
+    #[cfg(feature = "tree_perf_opt")]
+    pub fn get_mask_tree_cached(&self, key: git2::Oid) -> Option<git2::Oid> {
+        self.t2.borrow().mask_tree_cache.get(&key).copied()
+    }
+
+    #[cfg(not(feature = "tree_perf_opt"))]
+    pub fn get_mask_tree_cached(&self, _key: git2::Oid) -> Option<git2::Oid> {
+        None
+    }
+
+    #[cfg(feature = "tree_perf_opt")]
+    pub fn insert_mask_tree_cached(&self, key: git2::Oid, out: git2::Oid) {
+        let mut t2 = self.t2.borrow_mut();
+        if t2.mask_tree_cache.len() > TREE_OP_CACHE_MAX_ENTRIES {
+            t2.mask_tree_cache.clear();
+        }
+        t2.mask_tree_cache.insert(key, out);
+    }
+
+    #[cfg(not(feature = "tree_perf_opt"))]
+    pub fn insert_mask_tree_cached(&self, _key: git2::Oid, _out: git2::Oid) {}
+
+    #[cfg(feature = "tree_perf_opt")]
+    pub fn get_or_init_mask_marker(&self) -> crate::JoshResult<git2::Oid> {
+        if let Some(existing) = self.t2.borrow().mask_marker {
+            return Ok(existing);
+        }
+
+        let marker = self.repo.blob(b"mask")?;
+        let mut t2 = self.t2.borrow_mut();
+        t2.mask_marker = Some(marker);
+        Ok(marker)
+    }
+
+    #[cfg(not(feature = "tree_perf_opt"))]
+    pub fn get_or_init_mask_marker(&self) -> crate::JoshResult<git2::Oid> {
+        Ok(self.repo.blob(b"mask")?)
     }
 
     pub fn lookup_filter_hook(

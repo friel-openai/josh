@@ -1029,7 +1029,7 @@ pub fn mask_tree_from_paths(
 
     // A single marker blob reused for all leaf entries. Its contents are irrelevant; we only need
     // the OID to be a blob so `subtract()` will remove matching entries.
-    let marker = repo.blob(b"mask")?;
+    let marker = transaction.get_or_init_mask_marker()?;
 
     let mut root = MaskNode::Children(Default::default());
     for p in paths {
@@ -1040,6 +1040,7 @@ pub fn mask_tree_from_paths(
         root.insert_path(p);
     }
 
+    #[cfg(not(feature = "tree_perf_opt"))]
     fn write_node(
         repo: &git2::Repository,
         marker: git2::Oid,
@@ -1062,11 +1063,102 @@ pub fn mask_tree_from_paths(
         }
     }
 
+    #[cfg(feature = "tree_perf_opt")]
+    fn node_digest(
+        marker: git2::Oid,
+        node: &MaskNode,
+        cache: &mut std::collections::HashMap<usize, Option<git2::Oid>>,
+    ) -> JoshResult<Option<git2::Oid>> {
+        let key = node as *const MaskNode as usize;
+        if let Some(existing) = cache.get(&key) {
+            return Ok(*existing);
+        }
+
+        let digest = match node {
+            MaskNode::Terminal => {
+                let mut buf = Vec::with_capacity(1 + 20);
+                buf.push(1);
+                buf.extend_from_slice(marker.as_bytes());
+                Some(git2::Oid::hash_object(git2::ObjectType::Blob, &buf)?)
+            }
+            MaskNode::Children(children) => {
+                let mut buf = Vec::with_capacity(1 + (children.len() * 32));
+                buf.push(0);
+                for (name, child) in children {
+                    let Some(name) = name.to_str() else {
+                        cache.insert(key, None);
+                        return Ok(None);
+                    };
+                    buf.extend_from_slice(name.as_bytes());
+                    buf.push(0);
+                    let child_digest = node_digest(marker, child, cache)?;
+                    let Some(child_digest) = child_digest else {
+                        cache.insert(key, None);
+                        return Ok(None);
+                    };
+                    buf.extend_from_slice(child_digest.as_bytes());
+                }
+                Some(git2::Oid::hash_object(git2::ObjectType::Blob, &buf)?)
+            }
+        };
+
+        cache.insert(key, digest);
+        Ok(digest)
+    }
+
+    #[cfg(feature = "tree_perf_opt")]
+    fn write_node_cached(
+        transaction: &cache::Transaction,
+        repo: &git2::Repository,
+        marker: git2::Oid,
+        node: &MaskNode,
+        digest_cache: &mut std::collections::HashMap<usize, Option<git2::Oid>>,
+    ) -> JoshResult<git2::Oid> {
+        let digest = node_digest(marker, node, digest_cache)?;
+        if let Some(digest) = digest
+            && let Some(cached) = transaction.get_mask_tree_cached(digest)
+        {
+            return Ok(cached);
+        }
+
+        let out = match node {
+            MaskNode::Terminal => marker,
+            MaskNode::Children(children) => {
+                let mut builder = repo.treebuilder(None)?;
+                for (name, child) in children {
+                    let oid = write_node_cached(transaction, repo, marker, child, digest_cache)?;
+                    let mode = match child {
+                        MaskNode::Terminal => git2::FileMode::Blob.into(),
+                        MaskNode::Children(_) => git2::FileMode::Tree.into(),
+                    };
+                    builder.insert(std::path::Path::new(name), oid, mode)?;
+                }
+                builder.write()?
+            }
+        };
+
+        if let Some(digest) = digest {
+            transaction.insert_mask_tree_cached(digest, out);
+        }
+
+        Ok(out)
+    }
+
     match &root {
         // An empty/terminal root means “remove everything”. Returning a blob OID as the mask makes
         // `subtract(tree, mask_blob)` return the empty tree.
         MaskNode::Terminal => Ok(marker),
-        MaskNode::Children(_) => Ok(write_node(repo, marker, &root)?),
+        MaskNode::Children(_) => {
+            #[cfg(feature = "tree_perf_opt")]
+            {
+                let mut digest_cache = std::collections::HashMap::<usize, Option<git2::Oid>>::new();
+                return Ok(write_node_cached(transaction, repo, marker, &root, &mut digest_cache)?);
+            }
+            #[cfg(not(feature = "tree_perf_opt"))]
+            {
+                Ok(write_node(repo, marker, &root)?)
+            }
+        }
     }
 }
 
@@ -1131,11 +1223,46 @@ pub fn compose_file_selections_no_remap<'a>(
         }
     }
 
+    #[cfg(feature = "tree_perf_opt")]
+    fn select_node_digest(
+        node: &SelectNode,
+        cache: &mut std::collections::HashMap<usize, git2::Oid>,
+    ) -> JoshResult<git2::Oid> {
+        let key = node as *const SelectNode as usize;
+        if let Some(d) = cache.get(&key) {
+            return Ok(*d);
+        }
+
+        let mut buf = Vec::with_capacity(1 + (node.children.len() * 32));
+        buf.push(if node.terminal { 1 } else { 0 });
+        for (name, child) in &node.children {
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(0);
+            let child_digest = select_node_digest(child, cache)?;
+            buf.extend_from_slice(child_digest.as_bytes());
+        }
+
+        let digest = git2::Oid::hash_object(git2::ObjectType::Blob, &buf)?;
+        cache.insert(key, digest);
+        Ok(digest)
+    }
+
     fn build_subset(
-        repo: &git2::Repository,
+        transaction: &cache::Transaction,
         full: &git2::Tree<'_>,
         node: &SelectNode,
+        #[cfg(feature = "tree_perf_opt")] digest_cache: &mut std::collections::HashMap<usize, git2::Oid>,
     ) -> JoshResult<git2::Oid> {
+        let repo = transaction.repo();
+
+        #[cfg(feature = "tree_perf_opt")]
+        let digest = select_node_digest(node, digest_cache)?;
+
+        #[cfg(feature = "tree_perf_opt")]
+        if let Some(cached) = transaction.get_tree_subset_cached(full.id(), digest) {
+            return Ok(cached);
+        }
+
         let mut builder = repo.treebuilder(None)?;
 
         for (name, child) in &node.children {
@@ -1156,8 +1283,29 @@ pub fn compose_file_selections_no_remap<'a>(
                 continue;
             }
 
+            #[cfg(feature = "tree_perf_opt")]
+            {
+                let child_digest = select_node_digest(child, digest_cache)?;
+                if let Some(cached) = transaction.get_tree_subset_cached(entry.id(), child_digest) {
+                    if cached != empty_id() {
+                        builder.insert(
+                            std::path::Path::new(name),
+                            cached,
+                            git2::FileMode::Tree.into(),
+                        )?;
+                    }
+                    continue;
+                }
+            }
+
             let subtree = repo.find_tree(entry.id())?;
-            let subtree_id = build_subset(repo, &subtree, child)?;
+            let subtree_id = build_subset(
+                transaction,
+                &subtree,
+                child,
+                #[cfg(feature = "tree_perf_opt")]
+                digest_cache,
+            )?;
             if subtree_id != empty_id() {
                 builder.insert(
                     std::path::Path::new(name),
@@ -1167,10 +1315,24 @@ pub fn compose_file_selections_no_remap<'a>(
             }
         }
 
-        Ok(builder.write()?)
+        let out = builder.write()?;
+
+        #[cfg(feature = "tree_perf_opt")]
+        transaction.insert_tree_subset_cached(full.id(), digest, out);
+
+        Ok(out)
     }
 
-    let id = build_subset(repo, full_tree, &root)?;
+    #[cfg(feature = "tree_perf_opt")]
+    let mut digest_cache = std::collections::HashMap::<usize, git2::Oid>::new();
+
+    let id = build_subset(
+        transaction,
+        full_tree,
+        &root,
+        #[cfg(feature = "tree_perf_opt")]
+        &mut digest_cache,
+    )?;
     Ok(Some(repo.find_tree(id)?))
 }
 

@@ -1,5 +1,6 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use josh_core::{cache, cache_sled, cache_stack, filter};
+use josh_core::{cache, filter};
+use josh_core::cache::{CacheStack, SledCacheBackend};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -7,7 +8,7 @@ use std::sync::OnceLock;
 struct RepoFixture {
     repo_gitdir: std::path::PathBuf,
     tip: git2::Oid,
-    cache: std::sync::Arc<cache_stack::CacheStack>,
+    cache: std::sync::Arc<CacheStack>,
 }
 
 fn fixture() -> &'static RepoFixture {
@@ -83,9 +84,9 @@ fn fixture() -> &'static RepoFixture {
             )
             .unwrap();
 
-        cache_sled::sled_load(&repo.path().to_path_buf()).expect("sled_load");
+        cache::sled_load(&repo.path().to_path_buf()).expect("sled_load");
         let cache = std::sync::Arc::new(
-            cache_stack::CacheStack::new().with_backend(cache_sled::SledCacheBackend::default()),
+            CacheStack::new().with_backend(SledCacheBackend::default()),
         );
 
         RepoFixture {
@@ -98,7 +99,7 @@ fn fixture() -> &'static RepoFixture {
 
 fn open_tx(
     repo_gitdir: &std::path::Path,
-    cache: std::sync::Arc<cache_stack::CacheStack>,
+    cache: std::sync::Arc<CacheStack>,
 ) -> cache::Transaction {
     cache::TransactionContext::new(repo_gitdir, cache)
         .open(None)
@@ -133,7 +134,7 @@ fn bench_pin_apply(c: &mut Criterion) {
                 let out = filter::apply(
                     &tx,
                     stored_filter,
-                    filter::Apply::from_commit(&commit).unwrap(),
+                    filter::Rewrite::from_commit(&commit).unwrap(),
                 )
                 .expect("apply");
                 std::hint::black_box(out.tree().id());

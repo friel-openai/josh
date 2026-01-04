@@ -44,16 +44,18 @@ rustc-hash = "2.1.1"
 smallvec = "1.15.1"
 
 [features]
-default = ["fast_quote_if", "pathset_builders"]
+default = ["fast_quote_if", "pathset_builders", "tree_perf_opt"]
 incubating = []
 bench = []
 fast_quote_if = []
 trace_filter_specs = []
 pathset_builders = []
+tree_perf_opt = []
 
 [dev-dependencies]
 criterion = "0.7.0"
 rand = "0.9.2"
+sha2 = "0.10.9"
 tempfile = { workspace = true }
 
 [[bench]]
@@ -73,5 +75,10 @@ required-features = ["bench"]
 
 [[bench]]
 name = "hook_wide_filters"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "tree_ops_perf"
 harness = false
 required-features = ["bench"]
