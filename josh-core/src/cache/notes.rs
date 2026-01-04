@@ -1,8 +1,10 @@
-use super::transaction::{CACHE_VERSION, CacheBackend};
-use crate::JoshResult;
+use super::transaction::{CacheBackend, CACHE_VERSION};
 use crate::filter;
 use crate::filter::Filter;
+use crate::JoshResult;
 use std::collections::HashMap;
+
+const LEGACY_CACHE_VERSION: u64 = 24;
 
 pub struct NotesCacheBackend {
     repo: std::sync::Mutex<git2::Repository>,
@@ -46,6 +48,73 @@ fn note_path(key: git2::Oid, sequence_number: u128) -> String {
     )
 }
 
+fn tip_note_path(version: u64, key: git2::Oid) -> String {
+    format!("refs/josh/{}/tip/{}", version, key)
+}
+
+fn read_tip_for_version(
+    repo: &git2::Repository,
+    version: u64,
+    key: git2::Oid,
+    from: git2::Oid,
+) -> Option<git2::Oid> {
+    let path = tip_note_path(version, key);
+    let note = repo.find_note(Some(&path), from).ok()?;
+    let message = note.message().unwrap_or("").trim();
+    let Ok(result) = git2::Oid::from_str(message) else {
+        return None;
+    };
+
+    // `git2::Oid::zero()` is used as a sentinel for "filter produced no content".
+    if result == git2::Oid::zero() {
+        return Some(result);
+    }
+
+    // Notes may be fetched without the corresponding objects being present locally (e.g. partial
+    // fetches, stale notes, or corrupted entries). Treat such entries as cache misses so callers
+    // can recompute.
+    if repo.find_object(result, None).is_err() {
+        return None;
+    }
+
+    Some(result)
+}
+
+pub(crate) fn read_tip(
+    repo: &git2::Repository,
+    key: git2::Oid,
+    from: git2::Oid,
+) -> Option<git2::Oid> {
+    read_tip_for_version(repo, CACHE_VERSION, key, from)
+        .or_else(|| read_tip_for_version(repo, LEGACY_CACHE_VERSION, key, from))
+}
+
+pub(crate) fn write_tip(
+    repo: &git2::Repository,
+    key: git2::Oid,
+    from: git2::Oid,
+    to: git2::Oid,
+) -> JoshResult<()> {
+    let signature = super::transaction::josh_commit_signature()?;
+    repo.note(
+        &signature,
+        &signature,
+        Some(&tip_note_path(CACHE_VERSION, key)),
+        from,
+        &to.to_string(),
+        true,
+    )?;
+    repo.note(
+        &signature,
+        &signature,
+        Some(&tip_note_path(LEGACY_CACHE_VERSION, key)),
+        from,
+        &to.to_string(),
+        true,
+    )?;
+    Ok(())
+}
+
 impl CacheBackend for NotesCacheBackend {
     fn read(
         &self,
@@ -69,6 +138,10 @@ impl CacheBackend for NotesCacheBackend {
                 // Corrupt / unexpected note content: treat as a cache miss.
                 return Ok(None);
             };
+
+            if result == git2::Oid::zero() {
+                return Ok(Some(result));
+            }
 
             // Notes may be fetched without the corresponding objects being present locally (e.g.
             // partial fetches, stale notes, or corrupted entries). Treat such entries as cache
@@ -189,7 +262,8 @@ impl CacheBackend for NotesCacheBackendV24 {
 
         let repo = self.repo.lock()?;
         let mut seqs = self.sequence_numbers.lock()?;
-        let Some(sequence_number) = Self::compute_sequence_number_v24(&repo, &mut seqs, from) else {
+        let Some(sequence_number) = Self::compute_sequence_number_v24(&repo, &mut seqs, from)
+        else {
             return Ok(None);
         };
 
@@ -205,6 +279,10 @@ impl CacheBackend for NotesCacheBackendV24 {
             let Ok(result) = git2::Oid::from_str(message) else {
                 return Ok(None);
             };
+
+            if result == git2::Oid::zero() {
+                return Ok(Some(result));
+            }
 
             if repo.find_object(result, None).is_err() {
                 return Ok(None);
@@ -229,7 +307,8 @@ impl CacheBackend for NotesCacheBackendV24 {
 
         let repo = self.repo.lock()?;
         let mut seqs = self.sequence_numbers.lock()?;
-        let Some(sequence_number) = Self::compute_sequence_number_v24(&repo, &mut seqs, from) else {
+        let Some(sequence_number) = Self::compute_sequence_number_v24(&repo, &mut seqs, from)
+        else {
             return Ok(());
         };
 

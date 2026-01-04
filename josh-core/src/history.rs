@@ -51,9 +51,9 @@ pub fn walk_many(
     let walk = walk.with_hide_callback(&mut hide_callback)?;
 
     log::info!(
-        "Walking revwalk from {} input(s) for:\n{}\n",
+        "Walking revwalk from {} input(s) for filter {}",
         pushed_inputs,
-        filter::pretty(filter, 4),
+        filter.id(),
     );
     let mut n_in = 0;
     let mut n_out = 0;

@@ -450,7 +450,7 @@ fn common_post(filters: &Vec<Filter>) -> Option<(Filter, Vec<Filter>)> {
  */
 fn iterate(filter: Filter) -> Filter {
     let mut filter = filter;
-    log::debug!("opt::iterate:\n{}\n", pretty(filter, 0));
+    log::debug!("opt::iterate filter={}", filter.id());
     for i in 0..1000 {
         let optimized = step(filter);
         if filter == optimized {
