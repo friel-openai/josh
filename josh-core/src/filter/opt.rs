@@ -459,10 +459,10 @@ fn iterate(filter: Filter) -> Filter {
 
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
-                "stepop {}:\n{:?}\n->\n{:?}\n",
+                "stepop {}: {} -> {}",
                 i,
-                to_op(filter),
-                to_op(optimized)
+                filter.id(),
+                optimized.id(),
             );
         }
         filter = optimized;
