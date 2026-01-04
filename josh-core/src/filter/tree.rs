@@ -185,23 +185,51 @@ pub fn subtract(
             return Ok(input1);
         }
         rs_tracing::trace_scoped!("subtract fast");
-        let mut result_tree = tree1.clone();
 
-        for entry in tree2.iter() {
-            if let Some(e) = tree1.get_name(entry.name().ok_or_else(|| josh_error("no name"))?) {
-                result_tree = replace_child(
-                    repo,
-                    Path::new(entry.name().ok_or_else(|| josh_error("no name"))?),
-                    subtract(transaction, e.id(), entry.id())?,
-                    e.filemode(),
-                    &result_tree,
-                )?;
+        #[cfg(feature = "tree_perf_opt_fast_subtract")]
+        {
+            // Apply all child updates in a single treebuilder and write once. This avoids
+            // `repo.find_tree` reads and repeated treebuilder writes for each changed entry.
+            let mut builder = repo.treebuilder(Some(&tree1))?;
+            for entry in tree2.iter() {
+                let name = entry.name().ok_or_else(|| josh_error("no name"))?;
+                if let Some(e) = tree1.get_name(name) {
+                    let next = subtract(transaction, e.id(), entry.id())?;
+                    let path = Path::new(name);
+                    if next == git2::Oid::zero() || next == empty_id() {
+                        builder.remove(path).ok();
+                    } else {
+                        builder.insert(path, next, e.filemode()).ok();
+                    }
+                }
             }
+
+            let out = builder.write()?;
+            transaction.insert_subtract((input1, input2), out);
+            return Ok(out);
         }
 
-        transaction.insert_subtract((input1, input2), result_tree.id());
+        #[cfg(not(feature = "tree_perf_opt_fast_subtract"))]
+        {
+            let mut result_tree = tree1.clone();
 
-        return Ok(result_tree.id());
+            for entry in tree2.iter() {
+                let name = entry.name().ok_or_else(|| josh_error("no name"))?;
+                if let Some(e) = tree1.get_name(name) {
+                    result_tree = replace_child(
+                        repo,
+                        Path::new(name),
+                        subtract(transaction, e.id(), entry.id())?,
+                        e.filemode(),
+                        &result_tree,
+                    )?;
+                }
+            }
+
+            transaction.insert_subtract((input1, input2), result_tree.id());
+
+            return Ok(result_tree.id());
+        }
     }
 
     transaction.insert_subtract((input1, input2), empty_id());
@@ -1063,7 +1091,52 @@ pub fn mask_tree_from_paths(
         }
     }
 
-    #[cfg(feature = "tree_perf_opt")]
+    #[cfg(all(feature = "tree_perf_opt", feature = "tree_perf_opt_fast_digest"))]
+    fn node_digest(
+        marker: git2::Oid,
+        node: &MaskNode,
+        cache: &mut std::collections::HashMap<usize, Option<git2::Oid>>,
+    ) -> JoshResult<Option<git2::Oid>> {
+        use sha1::Digest as _;
+
+        let key = node as *const MaskNode as usize;
+        if let Some(existing) = cache.get(&key) {
+            return Ok(*existing);
+        }
+
+        let digest = match node {
+            MaskNode::Terminal => {
+                let mut hasher = sha1::Sha1::new();
+                hasher.update([1]);
+                hasher.update(marker.as_bytes());
+                Some(git2::Oid::from_bytes(&hasher.finalize())?)
+            }
+            MaskNode::Children(children) => {
+                let mut hasher = sha1::Sha1::new();
+                hasher.update([0]);
+                for (name, child) in children {
+                    let Some(name) = name.to_str() else {
+                        cache.insert(key, None);
+                        return Ok(None);
+                    };
+                    hasher.update(name.as_bytes());
+                    hasher.update([0]);
+                    let child_digest = node_digest(marker, child, cache)?;
+                    let Some(child_digest) = child_digest else {
+                        cache.insert(key, None);
+                        return Ok(None);
+                    };
+                    hasher.update(child_digest.as_bytes());
+                }
+                Some(git2::Oid::from_bytes(&hasher.finalize())?)
+            }
+        };
+
+        cache.insert(key, digest);
+        Ok(digest)
+    }
+
+    #[cfg(all(feature = "tree_perf_opt", not(feature = "tree_perf_opt_fast_digest")))]
     fn node_digest(
         marker: git2::Oid,
         node: &MaskNode,
@@ -1223,7 +1296,33 @@ pub fn compose_file_selections_no_remap<'a>(
         }
     }
 
-    #[cfg(feature = "tree_perf_opt")]
+    #[cfg(all(feature = "tree_perf_opt", feature = "tree_perf_opt_fast_digest"))]
+    fn select_node_digest(
+        node: &SelectNode,
+        cache: &mut std::collections::HashMap<usize, git2::Oid>,
+    ) -> JoshResult<git2::Oid> {
+        use sha1::Digest as _;
+
+        let key = node as *const SelectNode as usize;
+        if let Some(d) = cache.get(&key) {
+            return Ok(*d);
+        }
+
+        let mut hasher = sha1::Sha1::new();
+        hasher.update([if node.terminal { 1 } else { 0 }]);
+        for (name, child) in &node.children {
+            hasher.update(name.as_bytes());
+            hasher.update([0]);
+            let child_digest = select_node_digest(child, cache)?;
+            hasher.update(child_digest.as_bytes());
+        }
+
+        let digest = git2::Oid::from_bytes(&hasher.finalize())?;
+        cache.insert(key, digest);
+        Ok(digest)
+    }
+
+    #[cfg(all(feature = "tree_perf_opt", not(feature = "tree_perf_opt_fast_digest")))]
     fn select_node_digest(
         node: &SelectNode,
         cache: &mut std::collections::HashMap<usize, git2::Oid>,

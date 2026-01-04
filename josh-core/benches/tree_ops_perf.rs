@@ -7,8 +7,12 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 // How to run:
-// - Optimized (default-on `tree_perf_opt`): `cargo bench -p josh-core --features bench --bench tree_ops_perf`
-// - Baseline (disable default features, keep non-perf defaults): `cargo bench -p josh-core --no-default-features --features fast_quote_if,pathset_builders,bench --bench tree_ops_perf`
+// - Optimized (default-on `tree_perf_opt` + `tree_perf_opt_fast_digest`):
+//   `cargo bench -p josh-core --features bench --bench tree_ops_perf`
+// - Baseline (keep `tree_perf_opt` but disable `tree_perf_opt_fast_digest`):
+//   `cargo bench -p josh-core --no-default-features --features fast_quote_if,pathset_builders,tree_perf_opt,bench --bench tree_ops_perf`
+// - Baseline (disable `tree_perf_opt` entirely):
+//   `cargo bench -p josh-core --no-default-features --features fast_quote_if,pathset_builders,bench --bench tree_ops_perf`
 
 const N_COMMITS: usize = 100;
 
@@ -25,6 +29,7 @@ const PIN_EXTRA_POOL: usize = 1_000;
 
 const EXPECTED_COMPOSE_DIGEST_HEX: &str = "b5d4cdf69f2d8fe87aed47ac197c0bacb91f3b954e9efc736b456bd79170d8f4";
 const EXPECTED_MASK_DIGEST_HEX: &str = "37c16202ba8ef04c14ec1b96f1920f0beab23c63cc95edbcbd4dcecd773e4ed9";
+const EXPECTED_SUBTRACT_DIGEST_HEX: &str = "8eba01de125592730cf82a9e6bc1de786ce3717d33ff2bfa144fcb215c130b01";
 const EXPECTED_INSERT_DIGEST_HEX: &str = "b7d0b595d2387497f524402210789485eec260ad5251c892e4cfa25ced0e992e";
 
 struct RepoFixture {
@@ -230,6 +235,22 @@ fn compute_mask_digest(tx: &cache::Transaction, pin_sets: &[Vec<PathBuf>]) -> St
     digest_hex(hasher)
 }
 
+fn compute_subtract_digest(
+    tx: &cache::Transaction,
+    tree_ids: &[git2::Oid],
+    pin_sets: &[Vec<PathBuf>],
+) -> String {
+    let mut hasher = Sha256::new();
+    // Use a stable mask across commits to isolate `subtract()` cost.
+    let mask_paths = pin_sets.first().expect("pin_sets non-empty");
+    let mask = filter::tree::mask_tree_from_paths(tx, mask_paths).expect("mask_tree_from_paths");
+    for tree_id in tree_ids {
+        let out = filter::tree::subtract(tx, *tree_id, mask).expect("subtract");
+        hasher.update(out.as_bytes());
+    }
+    digest_hex(hasher)
+}
+
 fn compute_insert_digest(tx: &cache::Transaction, tree_ids: &[git2::Oid], insert_path: &PathBuf) -> String {
     let repo = tx.repo();
     let blob = repo.blob(b"bench insert").expect("blob");
@@ -282,6 +303,15 @@ fn bench_tree_ops(c: &mut Criterion) {
     }
     {
         let tx = open_tx(&f.repo_gitdir, f.cache.clone());
+        let actual = compute_subtract_digest(&tx, &f.tree_ids, &f.pin_sets);
+        assert_eq!(
+            actual,
+            EXPECTED_SUBTRACT_DIGEST_HEX,
+            "set EXPECTED_SUBTRACT_DIGEST_HEX to {actual}"
+        );
+    }
+    {
+        let tx = open_tx(&f.repo_gitdir, f.cache.clone());
         let actual = compute_insert_digest(&tx, &f.tree_ids, &f.insert_path);
         assert_eq!(
             actual,
@@ -306,6 +336,17 @@ fn bench_tree_ops(c: &mut Criterion) {
             || open_tx(&f.repo_gitdir, f.cache.clone()),
             |tx| {
                 let digest = compute_mask_digest(&tx, &f.pin_sets);
+                std::hint::black_box(digest);
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function(BenchmarkId::new("subtract", PIN_BASE_SIZE), |b| {
+        b.iter_batched(
+            || open_tx(&f.repo_gitdir, f.cache.clone()),
+            |tx| {
+                let digest = compute_subtract_digest(&tx, &f.tree_ids, &f.pin_sets);
                 std::hint::black_box(digest);
             },
             BatchSize::LargeInput,

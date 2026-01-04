@@ -37,6 +37,7 @@ strfmt = "0.2.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+sha1 = { version = "0.10.6", optional = true }
 sled = "0.34.7"
 tracing = { workspace = true }
 toml = { workspace = true }
@@ -44,13 +45,21 @@ rustc-hash = "2.1.1"
 smallvec = "1.15.1"
 
 [features]
-default = ["fast_quote_if", "pathset_builders", "tree_perf_opt"]
+default = [
+    "fast_quote_if",
+    "pathset_builders",
+    "tree_perf_opt",
+    "tree_perf_opt_fast_digest",
+    "tree_perf_opt_fast_subtract",
+]
 incubating = []
 bench = []
 fast_quote_if = []
 trace_filter_specs = []
 pathset_builders = []
 tree_perf_opt = []
+tree_perf_opt_fast_digest = ["dep:sha1"]
+tree_perf_opt_fast_subtract = []
 
 [dev-dependencies]
 criterion = "0.7.0"
