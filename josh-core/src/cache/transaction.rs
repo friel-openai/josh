@@ -2,12 +2,60 @@ use super::sled::sled_open_josh_trees;
 use super::stack::CacheStack;
 
 use std::collections::HashMap;
+#[cfg(feature = "tree_perf_opt")]
+use std::collections::VecDeque;
+#[cfg(feature = "tree_perf_opt")]
+use std::hash::Hash;
 use std::sync::{LazyLock, RwLock};
 
 pub(crate) const CACHE_VERSION: u64 = 25;
 
 #[cfg(feature = "tree_perf_opt")]
-const TREE_OP_CACHE_MAX_ENTRIES: usize = 200_000;
+const TREE_OP_CACHE_INITIAL_MAX_ENTRIES: usize = 200_000;
+
+#[cfg(feature = "tree_perf_opt")]
+const TREE_OP_CACHE_DEFAULT_HARD_MAX_ENTRIES: usize = 2_000_000;
+
+#[cfg(feature = "tree_perf_opt")]
+fn tree_op_cache_initial_max_entries() -> usize {
+    std::env::var("JOSH_TREE_OP_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(TREE_OP_CACHE_INITIAL_MAX_ENTRIES)
+}
+
+#[cfg(feature = "tree_perf_opt")]
+fn tree_op_cache_hard_max_entries_limit(initial_max_entries: usize) -> usize {
+    std::env::var("JOSH_TREE_OP_CACHE_HARD_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= initial_max_entries)
+        .unwrap_or_else(|| {
+            std::cmp::max(TREE_OP_CACHE_DEFAULT_HARD_MAX_ENTRIES, initial_max_entries)
+        })
+}
+
+#[cfg(feature = "tree_perf_opt")]
+fn evict_fifo_to_len<K: Copy + Eq + Hash, V>(
+    map: &mut HashMap<K, V>,
+    queue: &mut VecDeque<K>,
+    target_len: usize,
+) {
+    while map.len() > target_len {
+        if let Some(key) = queue.pop_front() {
+            map.remove(&key);
+            continue;
+        }
+
+        // If the queue somehow desyncs, fall back to evicting arbitrary keys.
+        if let Some((&key, _)) = map.iter().next() {
+            map.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
 
 pub trait CacheBackend: Send + Sync {
     fn read(
@@ -103,7 +151,17 @@ struct Transaction2 {
     #[cfg(feature = "tree_perf_opt")]
     tree_subset_cache: HashMap<(git2::Oid, git2::Oid), git2::Oid>,
     #[cfg(feature = "tree_perf_opt")]
+    tree_subset_cache_max_entries: usize,
+    #[cfg(feature = "tree_perf_opt")]
+    tree_subset_cache_queue: VecDeque<(git2::Oid, git2::Oid)>,
+    #[cfg(feature = "tree_perf_opt")]
     mask_tree_cache: HashMap<git2::Oid, git2::Oid>,
+    #[cfg(feature = "tree_perf_opt")]
+    mask_tree_cache_max_entries: usize,
+    #[cfg(feature = "tree_perf_opt")]
+    mask_tree_cache_queue: VecDeque<git2::Oid>,
+    #[cfg(feature = "tree_perf_opt")]
+    tree_op_cache_hard_max_entries: usize,
     #[cfg(feature = "tree_perf_opt")]
     mask_marker: Option<git2::Oid>,
 
@@ -134,6 +192,12 @@ impl Transaction {
         let (path_tree, invert_tree, trigram_index_tree) =
             sled_open_josh_trees().expect("failed to open transaction");
 
+        #[cfg(feature = "tree_perf_opt")]
+        let tree_op_cache_max_entries = tree_op_cache_initial_max_entries();
+        #[cfg(feature = "tree_perf_opt")]
+        let tree_op_cache_hard_max_entries_limit =
+            tree_op_cache_hard_max_entries_limit(tree_op_cache_max_entries);
+
         Transaction {
             t2: std::cell::RefCell::new(Transaction2 {
                 commit_map: HashMap::new(),
@@ -145,7 +209,17 @@ impl Transaction {
                 #[cfg(feature = "tree_perf_opt")]
                 tree_subset_cache: HashMap::new(),
                 #[cfg(feature = "tree_perf_opt")]
+                tree_subset_cache_max_entries: tree_op_cache_max_entries,
+                #[cfg(feature = "tree_perf_opt")]
+                tree_subset_cache_queue: VecDeque::new(),
+                #[cfg(feature = "tree_perf_opt")]
                 mask_tree_cache: HashMap::new(),
+                #[cfg(feature = "tree_perf_opt")]
+                mask_tree_cache_max_entries: tree_op_cache_max_entries,
+                #[cfg(feature = "tree_perf_opt")]
+                mask_tree_cache_queue: VecDeque::new(),
+                #[cfg(feature = "tree_perf_opt")]
+                tree_op_cache_hard_max_entries: tree_op_cache_hard_max_entries_limit,
                 #[cfg(feature = "tree_perf_opt")]
                 mask_marker: None,
                 cache,
@@ -378,10 +452,29 @@ impl Transaction {
     #[cfg(feature = "tree_perf_opt")]
     pub fn insert_tree_subset_cached(&self, tree: git2::Oid, selection: git2::Oid, out: git2::Oid) {
         let mut t2 = self.t2.borrow_mut();
-        if t2.tree_subset_cache.len() > TREE_OP_CACHE_MAX_ENTRIES {
-            t2.tree_subset_cache.clear();
+        let key = (tree, selection);
+        let prev = t2.tree_subset_cache.insert(key, out);
+        if prev.is_none() {
+            t2.tree_subset_cache_queue.push_back(key);
         }
-        t2.tree_subset_cache.insert((tree, selection), out);
+        let next_len = t2.tree_subset_cache.len();
+        if next_len > t2.tree_subset_cache_max_entries {
+            if t2.tree_subset_cache_max_entries < t2.tree_op_cache_hard_max_entries {
+                let mut new_max = t2.tree_subset_cache_max_entries.saturating_mul(2);
+                new_max = std::cmp::max(new_max, next_len);
+                t2.tree_subset_cache_max_entries =
+                    std::cmp::min(new_max, t2.tree_op_cache_hard_max_entries);
+            } else {
+                // If we've reached the hard cap, evict a chunk instead of clearing the entire
+                // cache. Clearing everything can cause a catastrophic hit-rate collapse.
+                let target_len = (t2.tree_subset_cache_max_entries * 8) / 10;
+                let mut cache = std::mem::take(&mut t2.tree_subset_cache);
+                let mut queue = std::mem::take(&mut t2.tree_subset_cache_queue);
+                evict_fifo_to_len(&mut cache, &mut queue, target_len);
+                t2.tree_subset_cache = cache;
+                t2.tree_subset_cache_queue = queue;
+            }
+        }
     }
 
     #[cfg(not(feature = "tree_perf_opt"))]
@@ -400,10 +493,28 @@ impl Transaction {
     #[cfg(feature = "tree_perf_opt")]
     pub fn insert_mask_tree_cached(&self, key: git2::Oid, out: git2::Oid) {
         let mut t2 = self.t2.borrow_mut();
-        if t2.mask_tree_cache.len() > TREE_OP_CACHE_MAX_ENTRIES {
-            t2.mask_tree_cache.clear();
+        let prev = t2.mask_tree_cache.insert(key, out);
+        if prev.is_none() {
+            t2.mask_tree_cache_queue.push_back(key);
         }
-        t2.mask_tree_cache.insert(key, out);
+        let next_len = t2.mask_tree_cache.len();
+        if next_len > t2.mask_tree_cache_max_entries {
+            if t2.mask_tree_cache_max_entries < t2.tree_op_cache_hard_max_entries {
+                let mut new_max = t2.mask_tree_cache_max_entries.saturating_mul(2);
+                new_max = std::cmp::max(new_max, next_len);
+                t2.mask_tree_cache_max_entries =
+                    std::cmp::min(new_max, t2.tree_op_cache_hard_max_entries);
+            } else {
+                // If we've reached the hard cap, evict a chunk instead of clearing the entire
+                // cache. Clearing everything can cause a catastrophic hit-rate collapse.
+                let target_len = (t2.mask_tree_cache_max_entries * 8) / 10;
+                let mut cache = std::mem::take(&mut t2.mask_tree_cache);
+                let mut queue = std::mem::take(&mut t2.mask_tree_cache_queue);
+                evict_fifo_to_len(&mut cache, &mut queue, target_len);
+                t2.mask_tree_cache = cache;
+                t2.mask_tree_cache_queue = queue;
+            }
+        }
     }
 
     #[cfg(not(feature = "tree_perf_opt"))]
