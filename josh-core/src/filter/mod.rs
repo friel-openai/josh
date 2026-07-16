@@ -831,7 +831,14 @@ pub fn apply_to_commit2(
     match &op {
         Op::Nop => return Ok(Some(commit.id())),
         Op::Empty => return Ok(Some(git2::Oid::zero())),
+        _ => {
+            if let Some(oid) = transaction.get(filter, commit.id()) {
+                return Ok(Some(oid));
+            }
+        }
+    }
 
+    match &op {
         Op::Chain(filters) => {
             let mut current_oid = commit.id();
             for filter in filters {
@@ -856,12 +863,7 @@ pub fn apply_to_commit2(
             ))
             .transpose();
         }
-        _ => {
-            if let Some(oid) = transaction.get(filter, commit.id()) {
-                return Ok(Some(oid));
-            }
-            // Continue to process the filter if not cached
-        }
+        _ => {}
     };
 
     rs_tracing::trace_scoped!(
@@ -2351,6 +2353,36 @@ fn per_rev_filter(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn apply_to_commit2_honors_cached_chain_result() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = git2::Repository::init(tmp.path()).expect("init repo");
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let commit_oid = repo
+            .commit(Some("HEAD"), &signature, &signature, "test", &tree, &[])
+            .unwrap();
+
+        let gitdir = repo.path().to_path_buf();
+        crate::cache::sled_load(&gitdir).expect("sled_load");
+        let cache = std::sync::Arc::new(
+            crate::cache::CacheStack::new().with_backend(crate::cache::SledCacheBackend::default()),
+        );
+        let transaction = crate::cache::TransactionContext::new(&gitdir, cache)
+            .open(None)
+            .expect("open transaction");
+        let filter = parse("::README.md:prune=trivial-merge").unwrap();
+        assert!(matches!(peel_op(filter), Op::Chain(_)));
+        transaction.insert(filter, commit_oid, git2::Oid::zero(), false);
+
+        let commit = transaction.repo().find_commit(commit_oid).unwrap();
+        assert_eq!(
+            apply_to_commit2(filter, &commit, &transaction).unwrap(),
+            Some(git2::Oid::zero())
+        );
+    }
 
     #[test]
     fn src_path_test() {
