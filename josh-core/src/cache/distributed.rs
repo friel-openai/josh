@@ -207,10 +207,19 @@ impl CacheBackend for DistributedCacheBackend {
         from: git2::Oid,
         hint: HistoryGraphHint,
     ) -> anyhow::Result<Option<git2::Oid>> {
-        if filter == filter::sequence_number() || filter == filter::reachable_roots() {
+        if !is_eligible(hint) {
             return Ok(None);
         }
-        if !is_eligible(hint) {
+        self.read_forced(filter, from, hint)
+    }
+
+    fn read_forced(
+        &self,
+        filter: Filter,
+        from: git2::Oid,
+        hint: HistoryGraphHint,
+    ) -> anyhow::Result<Option<git2::Oid>> {
+        if filter == filter::sequence_number() || filter == filter::reachable_roots() {
             return Ok(None);
         }
         let repo = self.repo.lock().unwrap();
@@ -264,13 +273,23 @@ impl CacheBackend for DistributedCacheBackend {
         to: git2::Oid,
         hint: HistoryGraphHint,
     ) -> anyhow::Result<()> {
+        if !is_eligible(hint) {
+            return Ok(());
+        }
+        self.write_forced(filter, from, to, hint)
+    }
+
+    fn write_forced(
+        &self,
+        filter: Filter,
+        from: git2::Oid,
+        to: git2::Oid,
+        hint: HistoryGraphHint,
+    ) -> anyhow::Result<()> {
         if !self.writable {
             return Ok(());
         }
         if filter == filter::sequence_number() || filter == filter::reachable_roots() {
-            return Ok(());
-        }
-        if !is_eligible(hint) {
             return Ok(());
         }
 
@@ -291,5 +310,65 @@ impl CacheBackend for DistributedCacheBackend {
         self.flush(false)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_entries_bypass_sparse_eligibility() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        repo.treebuilder(None).unwrap().write().unwrap();
+
+        let filter = Filter::new().subdir("selected");
+        let from = git2::Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let to = git2::Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let hint = HistoryGraphHint {
+            sequence_number: 1,
+            parent_count: 1,
+        };
+        let backend = DistributedCacheBackend::writable(directory.path()).unwrap();
+
+        backend.write(filter, from, to, hint).unwrap();
+        assert_eq!(backend.read_forced(filter, from, hint).unwrap(), None);
+
+        backend.write_forced(filter, from, to, hint).unwrap();
+        assert_eq!(backend.read(filter, from, hint).unwrap(), None);
+        assert_eq!(backend.read_forced(filter, from, hint).unwrap(), Some(to));
+
+        backend.flush(true).unwrap();
+
+        let reader = DistributedCacheBackend::new(directory.path()).unwrap();
+        assert_eq!(reader.read(filter, from, hint).unwrap(), None);
+        assert_eq!(reader.read_forced(filter, from, hint).unwrap(), Some(to));
+    }
+
+    #[test]
+    fn forced_writes_preserve_read_only_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        repo.treebuilder(None).unwrap().write().unwrap();
+
+        let filter = Filter::new().subdir("selected");
+        let from = git2::Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let to = git2::Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let hint = HistoryGraphHint {
+            sequence_number: 1,
+            parent_count: 1,
+        };
+        let backend = DistributedCacheBackend::new(directory.path()).unwrap();
+
+        backend.write_forced(filter, from, to, hint).unwrap();
+
+        assert_eq!(backend.read_forced(filter, from, hint).unwrap(), None);
+        assert!(
+            repo.references_glob("refs/josh/cache/32/*")
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 }

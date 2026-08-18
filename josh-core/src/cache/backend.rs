@@ -12,6 +12,16 @@ pub trait CacheBackend: Send + Sync {
         hint: HistoryGraphHint,
     ) -> anyhow::Result<Option<git2::Oid>>;
 
+    /// Read an explicitly requested commit even when it is not normally sampled.
+    fn read_forced(
+        &self,
+        filter: crate::filter::Filter,
+        from: git2::Oid,
+        hint: HistoryGraphHint,
+    ) -> anyhow::Result<Option<git2::Oid>> {
+        self.read(filter, from, hint)
+    }
+
     fn write(
         &self,
         filter: crate::filter::Filter,
@@ -19,6 +29,17 @@ pub trait CacheBackend: Send + Sync {
         to: git2::Oid,
         hint: HistoryGraphHint,
     ) -> anyhow::Result<()>;
+
+    /// Persist an explicitly requested commit even when it is not normally sampled.
+    fn write_forced(
+        &self,
+        filter: crate::filter::Filter,
+        from: git2::Oid,
+        to: git2::Oid,
+        hint: HistoryGraphHint,
+    ) -> anyhow::Result<()> {
+        self.write(filter, from, to, hint)
+    }
 }
 
 /// Per-commit history-graph facts passed along with every cache record.

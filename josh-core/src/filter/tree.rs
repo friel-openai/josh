@@ -8,8 +8,10 @@ pub fn pathstree<'a>(
     transaction: &'a cache::Transaction,
 ) -> anyhow::Result<git2::Tree<'a>> {
     let repo = transaction.repo();
-    if let Some(cached) = transaction.get_paths((input, root.to_string())) {
-        return Ok(repo.find_tree(cached)?);
+    if let Some(cached) = transaction.get_paths((input, root.to_string()))
+        && let Ok(tree) = repo.find_tree(cached)
+    {
+        return Ok(tree);
     }
 
     let tree = repo.find_tree(input)?;
@@ -745,8 +747,10 @@ pub fn invert_paths<'a>(
     tree: git2::Tree<'a>,
 ) -> anyhow::Result<git2::Tree<'a>> {
     let repo = transaction.repo();
-    if let Some(cached) = transaction.get_invert((tree.id(), root.to_string())) {
-        return Ok(repo.find_tree(cached)?);
+    if let Some(cached) = transaction.get_invert((tree.id(), root.to_string()))
+        && let Ok(tree) = repo.find_tree(cached)
+    {
+        return Ok(tree);
     }
 
     let mut result = empty(repo);
@@ -960,6 +964,113 @@ mod tests {
         cache::sled_load(td.path()).unwrap();
         let ctx = cache::TransactionContext::new(td.path(), cache::CacheStack::default().into());
         ctx.open().unwrap()
+    }
+
+    #[test]
+    fn pathstree_rebuilds_missing_cached_tree() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(td.path()).unwrap();
+        let input = make_tree(&repo, &["directory/file.txt"]);
+        let transaction = open_transaction(&td);
+        let missing = git2::Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+
+        transaction.insert_paths((input, String::new()), missing);
+
+        let rebuilt = pathstree("", input, &transaction).unwrap();
+
+        assert_ne!(rebuilt.id(), missing);
+        assert_eq!(
+            transaction.get_paths((input, String::new())),
+            Some(rebuilt.id())
+        );
+        assert!(rebuilt.get_path(Path::new("directory/file.txt")).is_ok());
+    }
+
+    #[test]
+    fn invert_paths_rebuilds_missing_cached_tree() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(td.path()).unwrap();
+        let input = make_tree(&repo, &["directory/file.txt"]);
+        let transaction = open_transaction(&td);
+        let projected = pathstree("", input, &transaction).unwrap();
+        let projected_id = projected.id();
+        let missing = git2::Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+
+        transaction.insert_invert((projected_id, String::new()), missing);
+
+        let rebuilt = invert_paths(&transaction, "", projected).unwrap();
+
+        assert_ne!(rebuilt.id(), missing);
+        assert_eq!(
+            transaction.get_invert((projected_id, String::new())),
+            Some(rebuilt.id())
+        );
+        assert!(rebuilt.get_path(Path::new("directory/file.txt")).is_ok());
+    }
+
+    #[test]
+    fn remove_pred_rebuilds_missing_cached_tree() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(td.path()).unwrap();
+        let input = make_tree(&repo, &["directory/file.txt"]);
+        let transaction = open_transaction(&td);
+        let key = git2::Oid::from_str("cccccccccccccccccccccccccccccccccccccccc").unwrap();
+        let missing = git2::Oid::from_str("dddddddddddddddddddddddddddddddddddddddd").unwrap();
+        let root_key = git2::Oid::hash_object(
+            git2::ObjectType::Blob,
+            format!("glob-fallback:{:?}:", key).as_bytes(),
+        )
+        .unwrap();
+
+        transaction.insert_glob((input, root_key, 0), missing);
+
+        let rebuilt =
+            remove_pred(&transaction, &mut String::new(), input, &|_, _| true, key).unwrap();
+
+        assert_ne!(rebuilt, missing);
+        assert_eq!(transaction.get_glob((input, root_key, 0)), Some(rebuilt));
+        assert!(transaction.repo().find_tree(rebuilt).is_ok());
+    }
+
+    #[test]
+    fn remove_pattern_rebuilds_missing_cached_tree() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(td.path()).unwrap();
+        let input = make_tree(&repo, &["directory/file.txt"]);
+        let transaction = open_transaction(&td);
+        let key = git2::Oid::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+        let missing = git2::Oid::from_str("ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let pattern = CompiledPattern::compile("**/*.txt").unwrap();
+        let state = pattern.closure(CompiledPattern::initial_state());
+
+        transaction.insert_glob((input, key, state), missing);
+
+        let rebuilt = remove_pattern(&transaction, input, &pattern, key, state).unwrap();
+
+        assert_ne!(rebuilt, missing);
+        assert_eq!(transaction.get_glob((input, key, state)), Some(rebuilt));
+        assert!(transaction.repo().find_tree(rebuilt).is_ok());
+    }
+
+    #[test]
+    fn trigram_index_rebuilds_missing_cached_tree() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(td.path()).unwrap();
+        let input = make_tree(&repo, &["directory/file.txt"]);
+        let transaction = open_transaction(&td);
+        let missing = git2::Oid::from_str("1234567890123456789012345678901234567890").unwrap();
+
+        transaction.insert_trigram_index(input, missing);
+
+        let rebuilt = josh_search::trigram_index(
+            transaction.repo(),
+            &transaction,
+            transaction.repo().find_tree(input).unwrap(),
+        )
+        .unwrap();
+
+        assert_ne!(rebuilt.id(), missing);
+        assert_eq!(transaction.get_trigram_index(input), Some(rebuilt.id()));
     }
 
     // A gitlink (submodule) entry must be dropped from the rebuilt tree -- and must therefore

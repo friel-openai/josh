@@ -437,11 +437,12 @@ impl Transaction {
     }
 
     pub fn insert_glob(&self, tree: (git2::Oid, git2::Oid, u64), result: git2::Oid) {
-        GLOB_MAP.write().unwrap().entry(tree).or_insert(result);
+        GLOB_MAP.write().unwrap().insert(tree, result);
     }
 
     pub fn get_glob(&self, tree: (git2::Oid, git2::Oid, u64)) -> Option<git2::Oid> {
-        GLOB_MAP.read().unwrap().get(&tree).cloned()
+        let cached = GLOB_MAP.read().unwrap().get(&tree).copied()?;
+        self.repo.odb().ok()?.exists(cached).then_some(cached)
     }
 
     pub fn insert_ref(&self, filter: crate::filter::Filter, from: git2::Oid, to: git2::Oid) {
@@ -519,6 +520,22 @@ impl Transaction {
         Ok(())
     }
 
+    /// Persist an explicitly requested commit in sparse and dense cache backends.
+    pub(crate) fn insert_forced(
+        &self,
+        filter: crate::filter::Filter,
+        from: git2::Oid,
+        to: git2::Oid,
+    ) -> anyhow::Result<()> {
+        let hint = compute_history_hint(self, from)?;
+        let mut t2 = self.t2.borrow_mut();
+        t2.commit_map
+            .entry(filter.id())
+            .or_default()
+            .insert(from, to);
+        t2.cache.write_forced_all(filter, from, to, hint)
+    }
+
     pub fn get_missing(&self) -> anyhow::Result<Vec<(usize, crate::filter::Filter, git2::Oid)>> {
         let missing = self.t2.borrow().missing.clone();
         let mut retained = Vec::with_capacity(missing.len());
@@ -559,6 +576,24 @@ impl Transaction {
         filter: crate::filter::Filter,
         from: git2::Oid,
     ) -> anyhow::Result<Option<git2::Oid>> {
+        self.get_inner(filter, from, false)
+    }
+
+    /// Look up an explicitly requested commit in sparse and dense cache backends.
+    pub(crate) fn get_forced(
+        &self,
+        filter: crate::filter::Filter,
+        from: git2::Oid,
+    ) -> anyhow::Result<Option<git2::Oid>> {
+        self.get_inner(filter, from, true)
+    }
+
+    fn get_inner(
+        &self,
+        filter: crate::filter::Filter,
+        from: git2::Oid,
+        forced: bool,
+    ) -> anyhow::Result<Option<git2::Oid>> {
         if filter.is_nop() {
             return Ok(Some(from));
         }
@@ -579,7 +614,11 @@ impl Transaction {
             return Ok(Some(oid));
         }
 
-        let oid = t2.cache.read_propagate(filter, from, hint)?;
+        let oid = if forced {
+            t2.cache.read_forced_propagate(filter, from, hint)?
+        } else {
+            t2.cache.read_propagate(filter, from, hint)?
+        };
 
         if let Some(oid) = oid {
             if oid == git2::Oid::zero() {

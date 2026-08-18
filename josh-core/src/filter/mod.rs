@@ -383,11 +383,39 @@ pub fn apply_to_commit(
     commit: &git2::Commit,
     transaction: &cache::Transaction,
 ) -> anyhow::Result<git2::Oid> {
+    apply_to_commit_with_options(filter, commit, transaction, ApplyToCommitOptions::default())
+}
+
+/// Options for filtering one commit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ApplyToCommitOptions {
+    /// Store the requested commit even when sparse cache sampling would skip it.
+    pub force_cache: bool,
+}
+
+/// Calculate the filtered commit with explicit cache options.
+pub fn apply_to_commit_with_options(
+    filter: Filter,
+    commit: &git2::Commit,
+    transaction: &cache::Transaction,
+    options: ApplyToCommitOptions,
+) -> anyhow::Result<git2::Oid> {
     let filter = opt::optimize(filter);
+    let force_cache =
+        options.force_cache && filter != sequence_number() && filter != reachable_roots();
+
+    if force_cache && let Some(id) = transaction.get_forced(filter, commit.id())? {
+        transaction.insert_forced(filter, commit.id(), id)?;
+        return Ok(id);
+    }
+
     loop {
         let filtered = apply_to_commit2(filter, commit, transaction)?;
 
         if let Some(id) = filtered {
+            if force_cache {
+                transaction.insert_forced(filter, commit.id(), id)?;
+            }
             return Ok(id);
         }
 
@@ -2438,7 +2466,102 @@ fn downstack_commit_deps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::CacheBackend;
     use std::path::PathBuf;
+
+    fn filter_unsampled_endpoint(
+        force_cache: bool,
+    ) -> (tempfile::TempDir, Filter, git2::Oid, git2::Oid) {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+
+        let make_tree = |contents: &[u8]| {
+            let blob = repo.blob(contents).unwrap();
+            let mut update = git2::build::TreeUpdateBuilder::new();
+            update.upsert("selected/file.txt", blob, git2::FileMode::Blob);
+            let empty = repo.treebuilder(None).unwrap().write().unwrap();
+            update
+                .create_updated(&repo, &repo.find_tree(empty).unwrap())
+                .unwrap()
+        };
+
+        let root_tree = make_tree(b"root");
+        let root = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "root",
+                &repo.find_tree(root_tree).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let tip_tree = make_tree(b"tip");
+        let tip = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "tip",
+                &repo.find_tree(tip_tree).unwrap(),
+                &[&repo.find_commit(root).unwrap()],
+            )
+            .unwrap();
+        let filter = Filter::new().subdir("selected");
+
+        cache::sled_load(directory.path()).unwrap();
+        let filtered = {
+            let stack =
+                std::sync::Arc::new(cache::CacheStack::new().with_backend(
+                    cache::DistributedCacheBackend::writable(directory.path()).unwrap(),
+                ));
+            let context = cache::TransactionContext::new(directory.path(), stack);
+            let transaction = context.open().unwrap();
+            if force_cache {
+                apply_to_commit_with_options(
+                    filter,
+                    &repo.find_commit(tip).unwrap(),
+                    &transaction,
+                    ApplyToCommitOptions { force_cache: true },
+                )
+                .unwrap()
+            } else {
+                apply_to_commit(filter, &repo.find_commit(tip).unwrap(), &transaction).unwrap()
+            }
+        };
+
+        (directory, filter, tip, filtered)
+    }
+
+    #[test]
+    fn apply_to_commit_preserves_sparse_cache_by_default() {
+        let (directory, filter, tip, _) = filter_unsampled_endpoint(false);
+        let reader = cache::DistributedCacheBackend::new(directory.path()).unwrap();
+        let hint = cache::HistoryGraphHint {
+            sequence_number: 1,
+            parent_count: 1,
+        };
+
+        assert_eq!(reader.read(filter, tip, hint).unwrap(), None);
+        assert_eq!(reader.read_forced(filter, tip, hint).unwrap(), None);
+    }
+
+    #[test]
+    fn apply_to_commit_persists_unsampled_endpoint_when_requested() {
+        let (directory, filter, tip, filtered) = filter_unsampled_endpoint(true);
+        let reader = cache::DistributedCacheBackend::new(directory.path()).unwrap();
+        let hint = cache::HistoryGraphHint {
+            sequence_number: 1,
+            parent_count: 1,
+        };
+
+        assert_eq!(reader.read(filter, tip, hint).unwrap(), None);
+        assert_eq!(
+            reader.read_forced(filter, tip, hint).unwrap(),
+            Some(filtered)
+        );
+    }
 
     #[test]
     fn src_path_test() {

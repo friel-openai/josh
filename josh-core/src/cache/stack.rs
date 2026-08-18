@@ -42,6 +42,21 @@ impl CacheStack {
         Ok(())
     }
 
+    /// Persist an explicitly requested commit in every cache backend.
+    pub fn write_forced_all(
+        &self,
+        filter: filter::Filter,
+        from: git2::Oid,
+        to: git2::Oid,
+        hint: HistoryGraphHint,
+    ) -> anyhow::Result<()> {
+        for backend in &self.backends {
+            backend.write_forced(filter, from, to, hint)?;
+        }
+
+        Ok(())
+    }
+
     /// Try to read from the cache backend stack.
     ///
     /// When a record is found, it's propagated to the backends
@@ -54,14 +69,41 @@ impl CacheStack {
         from: git2::Oid,
         hint: HistoryGraphHint,
     ) -> anyhow::Result<Option<git2::Oid>> {
+        self.read_propagate_inner(filter, from, hint, false)
+    }
+
+    /// Read an explicitly requested commit from every cache backend.
+    pub fn read_forced_propagate(
+        &self,
+        filter: filter::Filter,
+        from: git2::Oid,
+        hint: HistoryGraphHint,
+    ) -> anyhow::Result<Option<git2::Oid>> {
+        self.read_propagate_inner(filter, from, hint, true)
+    }
+
+    fn read_propagate_inner(
+        &self,
+        filter: filter::Filter,
+        from: git2::Oid,
+        hint: HistoryGraphHint,
+        forced: bool,
+    ) -> anyhow::Result<Option<git2::Oid>> {
         let values = self
             .backends
             .iter()
             .enumerate()
-            .find_map(|(index, backend)| match backend.read(filter, from, hint) {
-                Ok(None) => None,
-                Ok(Some(oid)) => Some(Ok((index, oid))),
-                Err(e) => Some(Err(e)),
+            .find_map(|(index, backend)| {
+                let result = if forced {
+                    backend.read_forced(filter, from, hint)
+                } else {
+                    backend.read(filter, from, hint)
+                };
+                match result {
+                    Ok(None) => None,
+                    Ok(Some(oid)) => Some(Ok((index, oid))),
+                    Err(e) => Some(Err(e)),
+                }
             });
 
         let (index, oid) = match values {

@@ -101,8 +101,10 @@ pub fn trigram_index<'a>(
     cache: &dyn IndexCache,
     tree: git2::Tree<'a>,
 ) -> anyhow::Result<git2::Tree<'a>> {
-    if let Some(cached) = cache.get_index(tree.id()) {
-        return Ok(repo.find_tree(cached)?);
+    if let Some(cached) = cache.get_index(tree.id())
+        && let Ok(index) = repo.find_tree(cached)
+    {
+        return Ok(index);
     }
 
     let mut arrs_own = vec![vec![]; 8];
