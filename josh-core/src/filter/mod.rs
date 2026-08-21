@@ -2556,10 +2556,107 @@ mod tests {
             parent_count: 1,
         };
 
-        assert_eq!(reader.read(filter, tip, hint).unwrap(), None);
+        assert_eq!(reader.read(filter, tip, hint).unwrap(), Some(filtered));
         assert_eq!(
             reader.read_forced(filter, tip, hint).unwrap(),
             Some(filtered)
+        );
+    }
+
+    #[test]
+    fn apply_to_commit_reuses_forced_unsampled_parent_from_cold_cache() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TrackingDistributedCache {
+            backend: cache::DistributedCacheBackend,
+            expected_parent: git2::Oid,
+            parent_hits: Arc<AtomicUsize>,
+        }
+
+        impl cache::CacheBackend for TrackingDistributedCache {
+            fn read(
+                &self,
+                filter: Filter,
+                from: git2::Oid,
+                hint: cache::HistoryGraphHint,
+            ) -> anyhow::Result<Option<git2::Oid>> {
+                let result = self.backend.read(filter, from, hint)?;
+                if from == self.expected_parent && result.is_some() {
+                    self.parent_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(result)
+            }
+
+            fn write(
+                &self,
+                filter: Filter,
+                from: git2::Oid,
+                to: git2::Oid,
+                hint: cache::HistoryGraphHint,
+            ) -> anyhow::Result<()> {
+                self.backend.write(filter, from, to, hint)
+            }
+
+            fn write_forced(
+                &self,
+                filter: Filter,
+                from: git2::Oid,
+                to: git2::Oid,
+                hint: cache::HistoryGraphHint,
+            ) -> anyhow::Result<()> {
+                self.backend.write_forced(filter, from, to, hint)
+            }
+        }
+
+        let (directory, filter, parent, filtered_parent) = filter_unsampled_endpoint(true);
+        let repo = git2::Repository::open_bare(directory.path()).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let blob = repo.blob(b"child").unwrap();
+        let mut update = git2::build::TreeUpdateBuilder::new();
+        update.upsert("selected/file.txt", blob, git2::FileMode::Blob);
+        let child_tree = update
+            .create_updated(&repo, &repo.find_commit(parent).unwrap().tree().unwrap())
+            .unwrap();
+        let child = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "child",
+                &repo.find_tree(child_tree).unwrap(),
+                &[&repo.find_commit(parent).unwrap()],
+            )
+            .unwrap();
+
+        let parent_hits = Arc::new(AtomicUsize::new(0));
+        let backend = TrackingDistributedCache {
+            backend: cache::DistributedCacheBackend::writable(directory.path()).unwrap(),
+            expected_parent: parent,
+            parent_hits: Arc::clone(&parent_hits),
+        };
+        let stack = Arc::new(cache::CacheStack::new().with_backend(backend));
+        let context = cache::TransactionContext::new(directory.path(), stack);
+        let transaction = context.open().unwrap();
+        let filtered_child = apply_to_commit_with_options(
+            filter,
+            &repo.find_commit(child).unwrap(),
+            &transaction,
+            ApplyToCommitOptions { force_cache: true },
+        )
+        .unwrap();
+        transaction.flush_mem_odb().unwrap();
+
+        assert!(
+            parent_hits.load(Ordering::Relaxed) > 0,
+            "child traversal did not reuse the forced parent cache entry"
+        );
+        assert_eq!(
+            repo.find_commit(filtered_child)
+                .unwrap()
+                .parent_id(0)
+                .unwrap(),
+            filtered_parent
         );
     }
 

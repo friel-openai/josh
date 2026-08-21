@@ -172,6 +172,7 @@ impl DistributedCacheBackend {
 // The sparse cache is mostly only used for initial "cold starts" or longer "catch up".
 // For incremental filtering it's fine re-filter commits and rely on the local "dense" cache.
 // We store entries for 1% of all commits, and additionally all merges and orphans.
+// Reads must also honor explicitly persisted endpoints between sampled commits.
 // The parent count comes from the cached history-graph hint, so this check never
 // reads the commit from the ODB.
 fn is_eligible(hint: HistoryGraphHint) -> bool {
@@ -207,9 +208,6 @@ impl CacheBackend for DistributedCacheBackend {
         from: git2::Oid,
         hint: HistoryGraphHint,
     ) -> anyhow::Result<Option<git2::Oid>> {
-        if !is_eligible(hint) {
-            return Ok(None);
-        }
         self.read_forced(filter, from, hint)
     }
 
@@ -336,13 +334,13 @@ mod tests {
         assert_eq!(backend.read_forced(filter, from, hint).unwrap(), None);
 
         backend.write_forced(filter, from, to, hint).unwrap();
-        assert_eq!(backend.read(filter, from, hint).unwrap(), None);
+        assert_eq!(backend.read(filter, from, hint).unwrap(), Some(to));
         assert_eq!(backend.read_forced(filter, from, hint).unwrap(), Some(to));
 
         backend.flush(true).unwrap();
 
         let reader = DistributedCacheBackend::new(directory.path()).unwrap();
-        assert_eq!(reader.read(filter, from, hint).unwrap(), None);
+        assert_eq!(reader.read(filter, from, hint).unwrap(), Some(to));
         assert_eq!(reader.read_forced(filter, from, hint).unwrap(), Some(to));
     }
 
