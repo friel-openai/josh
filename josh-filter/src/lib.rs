@@ -1,3 +1,4 @@
+pub mod file_selection;
 pub mod filter;
 pub mod flang;
 pub mod op;

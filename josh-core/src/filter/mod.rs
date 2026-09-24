@@ -171,6 +171,7 @@ impl<'a> Rewrite<'a> {
 }
 
 pub use josh_filter::compose;
+pub use josh_filter::file_selection::FileSelection;
 pub use josh_filter::filter::files;
 
 pub fn lazy_refs(filter: Filter) -> Vec<String> {
