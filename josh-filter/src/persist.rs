@@ -18,7 +18,7 @@ pub(crate) struct Node {
 /// Canonicalizes each `Op` to a single interned node by structural equality, so equal `Op`s
 /// map to the same node (and therefore the same `Filter` pointer). `Op` derives `Hash`/`Eq`
 /// and its child `Filter`s hash/compare by pointer, so the `Op` itself is the key.
-static INTERN: LazyLock<std::sync::Mutex<HashMap<&'static Op, &'static Node>>> =
+static INTERN: LazyLock<std::sync::Mutex<HashMap<&'static Op, &'static Node, ahash::RandomState>>> =
     LazyLock::new(Default::default);
 
 pub fn peel_op(filter: Filter) -> Op {
