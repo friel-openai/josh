@@ -171,7 +171,11 @@ impl MemOdb {
                             return None;
                         }
                         let end = data.iter().position(|byte| *byte == 0)?;
-                        std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+                        let header = std::str::from_utf8(&data[..end]).ok()?;
+                        let (_, name) = header.split_once(' ')?;
+                        // libgit2 weights hint suffixes most. Reverse the name so
+                        // shared prefixes, rather than extensions, group trees.
+                        Some(name.chars().rev().collect::<String>())
                     })
                     .collect()
             };
