@@ -29,6 +29,27 @@ struct Inner {
     size: usize,
 }
 
+impl Inner {
+    /// Evict a sorted durable snapshot, preserving objects added while it was packed.
+    fn evict_snapshot(&mut self, snapshot: &[Oid]) {
+        let mut pending = snapshot.iter().peekable();
+        let mut evicted_bytes = 0;
+        self.map.retain(|oid, (_, data)| {
+            while pending.peek().is_some_and(|next| *next < oid) {
+                pending.next();
+            }
+            if pending.peek().is_some_and(|next| *next == oid) {
+                pending.next();
+                evicted_bytes += data.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.size = self.size.saturating_sub(evicted_bytes);
+    }
+}
+
 /// A per-operation in-memory object store. Create one with [`MemOdb::new`], attach it to a
 /// repository's object database with [`MemOdb::register`], and drain it to disk with
 /// [`MemOdb::flush`]. When `limit` is set, the store also enqueues a background pack from the write
@@ -187,11 +208,7 @@ impl MemOdb {
         // Writes that landed after the snapshot stay buffered for the next chunk or the drain, so a
         // background chunk running concurrently with the write path never drops a live object.
         let mut inner = self.inner.lock().unwrap();
-        for oid in &oids {
-            if let Some((_, data)) = inner.map.remove(oid) {
-                inner.size = inner.size.saturating_sub(data.len());
-            }
-        }
+        inner.evict_snapshot(&oids);
         Ok(())
     }
 }
@@ -261,6 +278,50 @@ fn raw_to_kind(kind: raw::git_object_t) -> ObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_eviction_preserves_interleaved_new_objects_and_size() {
+        let ids: Vec<_> = (0..10)
+            .map(|index| Oid::from_bytes(&[index; 20]).unwrap())
+            .collect();
+        for mask in 0..256 {
+            let mut inner = Inner {
+                map: ids[1..9]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, oid)| {
+                        (
+                            *oid,
+                            (raw::GIT_OBJECT_BLOB, vec![index as u8; index + 1].into()),
+                        )
+                    })
+                    .collect(),
+                size: 36,
+            };
+            let snapshot: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index == 0 || *index == 9 || mask & (1 << (index - 1)) != 0)
+                .map(|(_, oid)| *oid)
+                .collect();
+            let mut expected = inner.map.clone();
+            for oid in &snapshot {
+                expected.remove(oid);
+            }
+            inner.evict_snapshot(&snapshot);
+            assert_eq!(inner.map, expected, "snapshot subset {mask}");
+            assert_eq!(
+                inner.size,
+                expected.values().map(|(_, data)| data.len()).sum()
+            );
+            inner.evict_snapshot(&snapshot);
+            assert_eq!(inner.map, expected, "repeated eviction {mask}");
+            assert_eq!(
+                inner.size,
+                expected.values().map(|(_, data)| data.len()).sum()
+            );
+        }
+    }
 
     /// Objects written through a registered [`MemOdb`] are visible only in memory until flushed;
     /// after a flush a fresh repository (no backend) must find them on disk.
