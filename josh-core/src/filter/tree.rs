@@ -866,6 +866,14 @@ pub(super) enum IdentitySelection {
     Remove,
 }
 
+/// A parsed pure identity selection. Path strings belong to immutable interned filters.
+#[derive(Default)]
+pub(crate) struct IdentityPaths {
+    terminal: bool,
+    children: std::collections::BTreeMap<&'static str, IdentityPaths>,
+    cache_filter: Option<Filter>,
+}
+
 /// Select a composition of identity file filters without materializing one tree per file.
 /// File filters may select whole directories; a terminal path includes its subtree.
 /// Returning None keeps the general composition semantics for renames and metadata.
@@ -879,13 +887,10 @@ pub(super) fn select_identity_files<'a>(
     let repo = transaction.repo();
     // Filter nodes are immutable and interned. Borrow path components rather than
     // cloning every path each time a tree is selected.
-    #[derive(Default)]
-    struct Paths {
-        terminal: bool,
-        children: std::collections::BTreeMap<&'static str, Paths>,
-        cache_filter: Option<Filter>,
-    }
-    fn descend<'a>(mut node: &'a mut Paths, path: &'static Path) -> Option<&'a mut Paths> {
+    fn descend<'a>(
+        mut node: &'a mut IdentityPaths,
+        path: &'static Path,
+    ) -> Option<&'a mut IdentityPaths> {
         let path = path.to_str()?;
         for component in path.split('/') {
             if component.is_empty()
@@ -901,7 +906,7 @@ pub(super) fn select_identity_files<'a>(
         node.cache_filter = None;
         Some(node)
     }
-    fn collect(filter: Filter, paths: &mut Paths) -> Option<()> {
+    fn collect(filter: Filter, paths: &mut IdentityPaths) -> Option<()> {
         let was_empty = paths.children.is_empty() && !paths.terminal;
         paths.cache_filter = None;
         match josh_filter::persist::to_op_ref(filter) {
@@ -925,7 +930,7 @@ pub(super) fn select_identity_files<'a>(
         }
         Some(())
     }
-    fn collect_chain(filters: &[Filter], paths: &mut Paths) -> Option<()> {
+    fn collect_chain(filters: &[Filter], paths: &mut IdentityPaths) -> Option<()> {
         if let [filter] = filters {
             return collect(*filter, paths);
         }
@@ -945,16 +950,25 @@ pub(super) fn select_identity_files<'a>(
             _ => None,
         }
     }
-    let mut paths = Paths::default();
-    for filter in filters {
-        if collect(*filter, &mut paths).is_none() {
-            return Ok(None);
+    let cache_key = match filters {
+        [only] => *only,
+        _ => to_filter(Op::Compose(filters.to_vec())),
+    };
+    let mut paths = if let Some(paths) = transaction.take_identity_paths(cache_key) {
+        paths
+    } else {
+        let mut paths = IdentityPaths::default();
+        for filter in filters {
+            if collect(*filter, &mut paths).is_none() {
+                return Ok(None);
+            }
         }
-    }
+        paths
+    };
     // Name the selection relative to each subtree. Unchanged source subtrees
     // and unchanged policy branches can then reuse the transaction's tree cache.
     // These internal keys do not replace the caller's persisted policy identity.
-    fn prepare(paths: &mut Paths) -> Filter {
+    fn prepare(paths: &mut IdentityPaths) -> Filter {
         if let Some(filter) = paths.cache_filter {
             return filter;
         }
@@ -987,7 +1001,7 @@ pub(super) fn select_identity_files<'a>(
     fn select(
         transaction: &cache::Transaction,
         input: &git2::Tree<'_>,
-        paths: &mut Paths,
+        paths: &mut IdentityPaths,
         selection: IdentitySelection,
     ) -> anyhow::Result<Option<git2::Oid>> {
         let repo = transaction.repo();
@@ -1047,7 +1061,9 @@ pub(super) fn select_identity_files<'a>(
         transaction.insert_apply(key, input.id(), output);
         Ok(Some(output))
     }
-    select(transaction, input, &mut paths, selection)?
+    let selected = select(transaction, input, &mut paths, selection);
+    transaction.insert_identity_paths(cache_key, paths);
+    selected?
         .map(|oid| repo.find_tree(oid).map_err(Into::into))
         .transpose()
 }
@@ -1156,6 +1172,38 @@ mod tests {
         cache::sled_load(td.path()).unwrap();
         let ctx = cache::TransactionContext::new(td.path(), cache::CacheStack::default().into());
         ctx.open().unwrap()
+    }
+
+    #[test]
+    fn parsed_identity_paths_cache_evicts_and_rebuilds_without_changing_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let names = ["one", "two", "three", "four", "five", "six"];
+        let source = make_tree(&repo, &names);
+        let transaction = open_transaction(&directory);
+        let input = transaction.repo().find_tree(source).unwrap();
+        let filters: Vec<_> = names.iter().map(|name| Filter::new().file(*name)).collect();
+        for (filter, name) in filters.iter().zip(names) {
+            let actual =
+                select_identity_files(&transaction, &input, &[*filter], IdentitySelection::Keep)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(actual.id(), make_tree(&repo, &[name]));
+        }
+        assert!(transaction.take_identity_paths(filters[0]).is_none());
+        assert!(transaction.take_identity_paths(filters[1]).is_none());
+        for filter in &filters[2..] {
+            assert!(transaction.take_identity_paths(*filter).is_some());
+        }
+        let actual = select_identity_files(
+            &transaction,
+            &input,
+            &[filters[0]],
+            IdentitySelection::Remove,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual.id(), make_tree(&repo, &names[1..]));
     }
 
     #[test]
