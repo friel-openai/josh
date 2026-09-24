@@ -1211,5 +1211,10 @@ mod identity_tests {
         let plain_noop = to_filter(Op::Nop);
         assert_ne!(sentinel(git2::Oid::zero()), plain_noop);
         assert_eq!(plain_noop, to_filter(Op::Nop));
+        assert!(plain_noop.is_nop());
+        assert!(!crate::filter::sequence_number().is_nop());
+        assert!(!crate::filter::reachable_roots().is_nop());
+        assert!(!to_filter(Op::Empty).is_nop());
+        assert!(!to_filter(Op::File("a".into(), "a".into())).is_nop());
     }
 }

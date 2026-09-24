@@ -104,7 +104,8 @@ impl Filter {
     }
 
     pub fn is_nop(self) -> bool {
-        self == to_filter(Op::Nop)
+        static NOP: LazyLock<Filter> = LazyLock::new(|| to_filter(Op::Nop));
+        self == *NOP
     }
 
     /// Create a filter that produces an empty tree
