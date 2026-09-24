@@ -158,8 +158,25 @@ impl MemOdb {
                 Err(error) if error.code() == git2::ErrorCode::NotFound => {}
                 Err(error) => return Err(error),
             }
-            for oid in &to_pack {
-                pb.insert_object(*oid, None)?;
+            // A stable tree-entry name groups similarly shaped trees for delta search.
+            // This is only a packing hint: it never changes object bytes or ids. Copy
+            // the short hints before insertion, which reads through the same mutex.
+            let names: Vec<_> = {
+                let inner = self.inner.lock().unwrap();
+                to_pack
+                    .iter()
+                    .map(|oid| {
+                        let (kind, data) = inner.map.get(oid)?;
+                        if *kind != raw::GIT_OBJECT_TREE {
+                            return None;
+                        }
+                        let end = data.iter().position(|byte| *byte == 0)?;
+                        std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+                    })
+                    .collect()
+            };
+            for (oid, name) in to_pack.iter().zip(&names) {
+                pb.insert_object(*oid, name.as_deref())?;
             }
             // `packfile_path` resolves the common object directory, so this is correct for linked
             // worktrees (whose gitdir has no `objects/` of its own) as well as normal repos.
@@ -275,6 +292,35 @@ mod tests {
 
         // The store is drained: a second flush is a no-op.
         store.flush().unwrap();
+    }
+
+    #[test]
+    fn tree_pack_hints_preserve_raw_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let store = MemOdb::new(None, repo.path().to_owned());
+        store.register(&repo);
+        let mut trees = Vec::new();
+        for index in 0..32 {
+            let blob = repo.blob(format!("content {index}").as_bytes()).unwrap();
+            for name in [b"ordinary".as_slice(), b"bad\xff", b"space name"] {
+                let mut builder = repo.treebuilder(None).unwrap();
+                builder.insert(name, blob, 0o100644).unwrap();
+                let oid = builder.write().unwrap();
+                let bytes = repo.odb().unwrap().read(oid).unwrap().data().to_vec();
+                trees.push((oid, bytes));
+            }
+        }
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        trees.push((empty, Vec::new()));
+        store.flush().unwrap();
+        let fresh = git2::Repository::open_bare(directory.path()).unwrap();
+        let odb = fresh.odb().unwrap();
+        for (oid, bytes) in trees {
+            let object = odb.read(oid).unwrap();
+            assert_eq!(object.kind(), ObjectType::Tree);
+            assert_eq!(object.data(), bytes);
+        }
     }
 
     #[test]
