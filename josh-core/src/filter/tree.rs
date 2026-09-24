@@ -1025,9 +1025,12 @@ pub(super) fn select_identity_files<'a>(
         {
             return Ok(Some(output));
         }
-        let mut builder =
-            repo.treebuilder((selection == IdentitySelection::Remove).then_some(input))?;
-        let mut changed = false;
+        // Exclusions often leave a subtree unchanged. Copy its entries into a
+        // builder only after finding an entry that actually needs to change.
+        let mut builder = match selection {
+            IdentitySelection::Keep => Some(repo.treebuilder(None)?),
+            IdentitySelection::Remove => None,
+        };
         for (name, selected) in &mut paths.children {
             let Some(entry) = input.get_name(name) else {
                 continue;
@@ -1040,11 +1043,16 @@ pub(super) fn select_identity_files<'a>(
                 }
                 match selection {
                     IdentitySelection::Keep => {
-                        builder.insert(name, entry.id(), entry.filemode())?;
+                        builder
+                            .as_mut()
+                            .unwrap()
+                            .insert(name, entry.id(), entry.filemode())?;
                     }
                     IdentitySelection::Remove => {
-                        changed = true;
-                        builder.remove(name)?;
+                        if builder.is_none() {
+                            builder = Some(repo.treebuilder(Some(input))?);
+                        }
+                        builder.as_mut().unwrap().remove(name)?;
                     }
                 }
             } else if entry.kind() == Some(git2::ObjectType::Tree) {
@@ -1055,18 +1063,19 @@ pub(super) fn select_identity_files<'a>(
                 if selection == IdentitySelection::Remove && output == entry.id() {
                     continue;
                 }
-                changed = true;
+                if builder.is_none() {
+                    builder = Some(repo.treebuilder(Some(input))?);
+                }
                 if output != empty_id() {
-                    builder.insert(name, output, 0o040000)?;
+                    builder.as_mut().unwrap().insert(name, output, 0o040000)?;
                 } else if selection == IdentitySelection::Remove {
-                    builder.remove(name)?;
+                    builder.as_mut().unwrap().remove(name)?;
                 }
             }
         }
-        let output = if selection == IdentitySelection::Remove && !changed {
-            input.id()
-        } else {
-            builder.write()?
+        let output = match builder {
+            Some(builder) => builder.write()?,
+            None => input.id(),
         };
         transaction.insert_apply(key, input.id(), output);
         Ok(Some(output))
