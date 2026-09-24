@@ -6,14 +6,14 @@
 //!
 //! Packing itself runs on a background thread (see [`crate::flusher`]): the write path enqueues the
 //! work and keeps filtering, and a boundary flush blocks only until the pack is durable. The store's
-//! `Mutex` therefore guards concurrent access from the filter thread (writes/reads through the
+//! `RwLock` therefore guards concurrent access from the filter thread (writes/reads through the
 //! backend) and the flusher thread (which reads objects to pack them, then evicts them); it is
 //! `Send + Sync` so its `Arc` can cross to the flusher.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use git2::{ErrorClass, ErrorCode, ObjectType, Oid};
 use libgit2_sys as raw;
@@ -34,7 +34,7 @@ struct Inner {
 /// [`MemOdb::flush`]. When `limit` is set, the store also enqueues a background pack from the write
 /// path as soon as the buffered data exceeds it (see [`MemOdb::enqueue_chunk`]).
 pub struct MemOdb {
-    inner: Mutex<Inner>,
+    inner: RwLock<Inner>,
     limit: Option<usize>,
     pack_threads: Option<u32>,
     /// Repository the store is registered on, re-opened by the background flusher to run the
@@ -66,7 +66,7 @@ impl MemOdb {
 
     fn create(limit: Option<usize>, repo_path: PathBuf, pack_threads: Option<u32>) -> Arc<MemOdb> {
         Arc::new(MemOdb {
-            inner: Mutex::new(Inner {
+            inner: RwLock::new(Inner {
                 map: Default::default(),
                 size: 0,
             }),
@@ -93,7 +93,7 @@ impl MemOdb {
     /// exceeded its size limit, so the caller can flush.
     fn insert(&self, oid: Oid, kind: raw::git_object_t, data: Box<[u8]>) -> bool {
         let len = data.len();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         if inner.map.insert(oid, (kind, data)).is_none() {
             inner.size += len;
         }
@@ -140,13 +140,13 @@ impl MemOdb {
     pub(crate) fn pack_to_disk(self: &Arc<Self>) -> Result<(), git2::Error> {
         // Snapshot the oids under the lock, then release it. The objects must stay in the store
         // across the packbuilder below: `pb.write` reads each one back through the odb -> this
-        // backend -> `self.inner.lock()`, so we can neither hold the lock here (self-deadlock) nor
+        // backend -> `self.inner.read()`, so we can neither hold the lock here (self-deadlock) nor
         // drain the map before the pack is on disk. A BTreeMap iterates in sorted oid order, so the
         // default single-threaded packbuilder produces a deterministic packfile. An explicit
         // parallel pack.threads setting can change delta choices and physical pack names,
         // but never object ids or the durability boundary.
         let oids: Vec<Oid> = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.read().unwrap();
             if inner.map.is_empty() {
                 return Ok(());
             }
@@ -181,9 +181,9 @@ impl MemOdb {
             }
             // A stable tree-entry name groups similarly shaped trees for delta search.
             // This is only a packing hint: it never changes object bytes or ids. Copy
-            // the short hints before insertion, which reads through the same mutex.
+            // the short hints before insertion, which reads through the same store lock.
             let names: Vec<_> = {
-                let inner = self.inner.lock().unwrap();
+                let inner = self.inner.read().unwrap();
                 to_pack
                     .iter()
                     .map(|oid| {
@@ -207,7 +207,7 @@ impl MemOdb {
         // Evict exactly the snapshotted oids (now durable: packed just above, or already on disk).
         // Writes that landed after the snapshot stay buffered for the next chunk or the drain, so a
         // background chunk running concurrently with the write path never drops a live object.
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         for oid in &oids {
             if let Some((_, data)) = inner.map.remove(oid) {
                 inner.size = inner.size.saturating_sub(data.len());
@@ -237,7 +237,7 @@ impl OdbBackend for MemBackend {
     fn read_header(&self, oid: Oid) -> Result<(usize, ObjectType), git2::Error> {
         self.store
             .inner
-            .lock()
+            .read()
             .unwrap()
             .map
             .get(&oid)
@@ -248,7 +248,7 @@ impl OdbBackend for MemBackend {
     fn read(&self, oid: Oid) -> Result<(Vec<u8>, ObjectType), git2::Error> {
         self.store
             .inner
-            .lock()
+            .read()
             .unwrap()
             .map
             .get(&oid)
@@ -265,7 +265,7 @@ impl OdbBackend for MemBackend {
     }
 
     fn exists(&self, oid: Oid) -> bool {
-        self.store.inner.lock().unwrap().map.contains_key(&oid)
+        self.store.inner.read().unwrap().map.contains_key(&oid)
     }
 
     fn exists_prefix(&self, _oid: Oid, _oid_len: usize) -> Option<Oid> {
