@@ -105,8 +105,6 @@ impl TransactionContext {
 struct Transaction2 {
     commit_map: HashMap<git2::Oid, HashMap<git2::Oid, git2::Oid>>,
     apply_map: HashMap<git2::Oid, HashMap<git2::Oid, git2::Oid>>,
-    identity_paths:
-        std::collections::VecDeque<(crate::filter::Filter, crate::filter::tree::IdentityPaths)>,
     subtract_map: HashMap<(git2::Oid, git2::Oid), git2::Oid>,
     intersect_map: HashMap<(git2::Oid, git2::Oid), git2::Oid>,
     overlay_map: HashMap<(git2::Oid, git2::Oid), git2::Oid>,
@@ -186,7 +184,6 @@ impl Transaction {
             t2: std::cell::RefCell::new(Transaction2 {
                 commit_map: HashMap::new(),
                 apply_map: HashMap::new(),
-                identity_paths: std::collections::VecDeque::new(),
                 subtract_map: HashMap::new(),
                 intersect_map: HashMap::new(),
                 overlay_map: HashMap::new(),
@@ -256,35 +253,6 @@ impl Transaction {
         let prev = self.t2.borrow().nesting_level;
         self.t2.borrow_mut().nesting_level = level;
         prev
-    }
-
-    /// Move a parsed selection out while it is applied, releasing the transaction
-    /// borrow before tree-result cache lookups. The caller returns it afterwards.
-    pub(crate) fn take_identity_paths(
-        &self,
-        filter: crate::filter::Filter,
-    ) -> Option<crate::filter::tree::IdentityPaths> {
-        let mut state = self.t2.borrow_mut();
-        let position = state
-            .identity_paths
-            .iter()
-            .position(|(key, _)| *key == filter)?;
-        state
-            .identity_paths
-            .remove(position)
-            .map(|(_, paths)| paths)
-    }
-
-    pub(crate) fn insert_identity_paths(
-        &self,
-        filter: crate::filter::Filter,
-        paths: crate::filter::tree::IdentityPaths,
-    ) {
-        let mut state = self.t2.borrow_mut();
-        state.identity_paths.push_front((filter, paths));
-        // Retain only a few active policy selections, rather than every policy
-        // encountered while walking a large history. This cache is not persisted.
-        state.identity_paths.truncate(4);
     }
 
     pub fn insert_apply(&self, filter: crate::filter::Filter, from: git2::Oid, to: git2::Oid) {
