@@ -366,6 +366,87 @@ pub fn compose(filters: &[Filter]) -> Filter {
     opt::optimize(persist::to_filter(Op::Compose(filters.to_vec())))
 }
 
+/// Select exact file paths, like composing one `Filter::new().file(path)` per path.
+/// Build shared directory structure before optimization to avoid constructing and
+/// simplifying a complete ancestor chain independently for every file. Filter IDs
+/// remain canonical. Noncanonical, duplicate and overlapping paths use composition.
+pub fn files<I, P>(paths: I) -> Filter
+where
+    I: IntoIterator<Item = P>,
+    P: Into<std::path::PathBuf>,
+{
+    use std::collections::BTreeMap;
+    use std::path::{Component, PathBuf};
+
+    #[derive(Default)]
+    struct Paths<'a> {
+        terminal: bool,
+        children: BTreeMap<&'a str, Paths<'a>>,
+    }
+    fn collect(paths: &[PathBuf]) -> Option<Paths<'_>> {
+        let mut root = Paths::default();
+        for path in paths {
+            let text = path.to_str()?;
+            if text.is_empty() || text.contains('\0') {
+                return None;
+            }
+            // Require the textual POSIX spelling to match native normal components.
+            // This also keeps Windows prefixes/separators on the general path.
+            if !path
+                .components()
+                .map(|component| match component {
+                    Component::Normal(name) => name.to_str(),
+                    _ => None,
+                })
+                .eq(text.split('/').map(Some))
+            {
+                return None;
+            }
+            let mut node = &mut root;
+            for component in text.split('/') {
+                if node.terminal {
+                    return None;
+                }
+                node = node.children.entry(component).or_default();
+            }
+            if node.terminal || !node.children.is_empty() {
+                return None;
+            }
+            node.terminal = true;
+        }
+        Some(root)
+    }
+    fn build(paths: &Paths<'_>) -> Filter {
+        let branches = paths
+            .children
+            .iter()
+            .map(|(name, child)| {
+                if child.terminal {
+                    to_filter(Op::File((*name).into(), (*name).into()))
+                } else {
+                    to_filter(Op::Chain(vec![
+                        to_filter(Op::Subdir((*name).into())),
+                        build(child),
+                        to_filter(Op::Prefix((*name).into())),
+                    ]))
+                }
+            })
+            .collect();
+        to_filter(Op::Compose(branches))
+    }
+    let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
+    if let Some(grouped) = collect(&paths) {
+        opt::optimize(build(&grouped))
+    } else {
+        compose(
+            &paths
+                .into_iter()
+                .map(|path| Filter::new().file(path))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
 pub fn invert(filter: Filter) -> anyhow::Result<Filter> {
     opt::invert(filter)
 }
@@ -389,4 +470,70 @@ pub fn reachable_roots() -> Filter {
         persist::sentinel(git2::Oid::from_bytes(&bytes).expect("valid sentinel oid"))
     });
     *F
+}
+
+#[cfg(test)]
+mod file_builder_tests {
+    use super::*;
+
+    #[test]
+    fn bulk_files_preserve_canonical_filter_identities() {
+        let candidates = [
+            "root",
+            "a/one",
+            "a/two",
+            "a/deep/three",
+            "b/z",
+            "b/space name",
+            "b/[literal]",
+            ".hidden/x",
+            "unicode/é",
+            "unicode/日本語",
+            "a-b/x",
+        ];
+        for seed in 0..128 {
+            let mut paths: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| (index * 7 + seed * 13) % 11 < 7)
+                .map(|(_, path)| *path)
+                .collect();
+            if seed % 2 == 0 {
+                paths.reverse();
+            }
+            let expected = compose(
+                &paths
+                    .iter()
+                    .map(|path| Filter::new().file(*path))
+                    .collect::<Vec<_>>(),
+            );
+            let actual = files(paths);
+            assert_eq!(actual, expected, "subset {seed}");
+            assert_eq!(actual.id(), expected.id());
+        }
+        for paths in [
+            vec![],
+            vec!["root"],
+            vec!["a/one", "a/one"],
+            vec!["a", "a/one"],
+            vec!["a/one", "a"],
+            vec![""],
+            vec!["/root"],
+            vec!["a//one"],
+            vec!["a/./one"],
+            vec!["a/../one"],
+            vec!["a/one/"],
+            vec!["a\0b"],
+        ] {
+            assert_eq!(
+                files(paths.clone()),
+                compose(
+                    &paths
+                        .iter()
+                        .map(|path| Filter::new().file(*path))
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
+    }
 }
