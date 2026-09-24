@@ -1190,9 +1190,10 @@ mod tests {
                     .unwrap();
             assert_eq!(actual.id(), make_tree(&repo, &[name]));
         }
-        assert!(transaction.take_identity_paths(filters[0]).is_none());
-        assert!(transaction.take_identity_paths(filters[1]).is_none());
-        for filter in &filters[2..] {
+        for filter in &filters[..4] {
+            assert!(transaction.take_identity_paths(*filter).is_none());
+        }
+        for filter in &filters[4..] {
             assert!(transaction.take_identity_paths(*filter).is_some());
         }
         let actual = select_identity_files(

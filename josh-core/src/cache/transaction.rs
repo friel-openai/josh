@@ -284,7 +284,7 @@ impl Transaction {
         state.identity_paths.push_front((filter, paths));
         // Retain only a few active policy selections, rather than every policy
         // encountered while walking a large history. This cache is not persisted.
-        state.identity_paths.truncate(4);
+        state.identity_paths.truncate(2);
     }
 
     pub fn insert_apply(&self, filter: crate::filter::Filter, from: git2::Oid, to: git2::Oid) {
