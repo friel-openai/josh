@@ -867,8 +867,9 @@ pub(super) enum IdentitySelection {
 }
 
 /// Select a composition of identity file filters without materializing one tree per file.
-/// Returning None keeps the general composition semantics for renames, metadata and
-/// directory selections. The filter itself is unchanged, including its persistent cache key.
+/// File filters may select whole directories; a terminal path includes its subtree.
+/// Returning None keeps the general composition semantics for renames and metadata.
+/// The filter itself is unchanged, including its persistent cache key.
 pub(super) fn select_identity_files<'a>(
     repo: &'a git2::Repository,
     input: &git2::Tree<'a>,
@@ -952,9 +953,10 @@ pub(super) fn select_identity_files<'a>(
                 continue;
             };
             if selected.terminal {
-                // Keep directory and overlapping ancestor/descendant cases on the general path.
-                if entry.kind() == Some(git2::ObjectType::Tree) {
-                    return Ok(None);
+                // File(path) also selects whole directories. Empty trees are omitted
+                // by the general insert path, so they select nothing here as well.
+                if entry.id() == empty_id() || entry.id().is_zero() {
+                    continue;
                 }
                 match selection {
                     IdentitySelection::Keep => {
@@ -1126,6 +1128,12 @@ mod tests {
                 0o040000,
             )
             .unwrap();
+        let a = repo.find_tree(subtree.get_name("a").unwrap().id()).unwrap();
+        let mut a_builder = repo.treebuilder(Some(&a)).unwrap();
+        a_builder.insert("empty", empty_id(), 0o040000).unwrap();
+        builder
+            .insert("a", a_builder.write().unwrap(), 0o040000)
+            .unwrap();
         builder
             .insert(
                 "submodule",
@@ -1141,6 +1149,11 @@ mod tests {
         let input = transaction.repo().find_tree(source).unwrap();
         let paths = [
             "root",
+            "a",
+            "a/deep",
+            "a/empty",
+            "b",
+            "empty",
             "a/one",
             "a/two",
             "a/deep/three",
@@ -1215,11 +1228,6 @@ mod tests {
             );
         }
         for filters in [
-            vec![to_filter(Op::File("a".into(), "a".into()))],
-            vec![
-                to_filter(Op::File("a".into(), "a".into())),
-                to_filter(Op::File("a/one".into(), "a/one".into())),
-            ],
             vec![to_filter(Op::File("other".into(), "root".into()))],
             vec![to_filter(Op::File("/root".into(), "/root".into()))],
             vec![to_filter(Op::File("a/../root".into(), "a/../root".into()))],
