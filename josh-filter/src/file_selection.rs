@@ -1,5 +1,4 @@
 //! Optional incremental construction for evolving exact-path selections.
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::{Filter, Op, filter, opt, persist};
@@ -18,7 +17,7 @@ pub struct FileSelection {
 #[derive(Default)]
 struct Paths {
     terminal: bool,
-    children: BTreeMap<String, Paths>,
+    children: Vec<(String, Paths)>,
     filter: Option<Filter>,
 }
 
@@ -108,19 +107,25 @@ impl Paths {
     fn set<'a>(&mut self, mut components: impl Iterator<Item = &'a str>, terminal: bool) {
         self.filter = None;
         if let Some(name) = components.next() {
+            let position = self
+                .children
+                .binary_search_by(|(child_name, _)| child_name.as_str().cmp(name));
             if terminal {
-                self.children
-                    .entry(name.to_owned())
-                    .or_default()
-                    .set(components, true);
+                let index = match position {
+                    Ok(index) => index,
+                    Err(index) => {
+                        self.children
+                            .insert(index, (name.to_owned(), Paths::default()));
+                        index
+                    }
+                };
+                self.children[index].1.set(components, true);
             } else {
-                let child = self
-                    .children
-                    .get_mut(name)
-                    .expect("previously selected path");
+                let index = position.expect("previously selected path");
+                let child = &mut self.children[index].1;
                 child.set(components, false);
                 if !child.terminal && child.children.is_empty() {
-                    self.children.remove(name);
+                    self.children.remove(index);
                 }
             }
         } else {
@@ -134,6 +139,7 @@ impl Paths {
         }
         let mut branches = Vec::new();
         for (name, child) in &mut self.children {
+            let name = name.as_str();
             if child.terminal {
                 branches.push(persist::to_filter(Op::File(name.into(), name.into())));
             }
