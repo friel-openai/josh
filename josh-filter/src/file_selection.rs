@@ -29,8 +29,6 @@ impl FileSelection {
         P: Into<PathBuf>,
     {
         let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
-        // Exact byte equality with the last validated input also proves that
-        // this input is canonical. Avoid revalidating unchanged policies.
         if let Some(tree) = &mut self.tree
             && self.paths.len() == paths.len()
             && self
@@ -41,34 +39,60 @@ impl FileSelection {
         {
             return tree.build();
         }
-        let mut previous = None;
-        let canonical = paths.iter().all(|path| {
-            let Some(text) = path.to_str() else {
-                return false;
-            };
-            if text.is_empty()
-                || text.contains('\0')
-                || previous.is_some_and(|old| old >= text)
-                || text
-                    .split('/')
-                    .any(|name| name.is_empty() || name == "." || name == "..")
-            {
-                return false;
-            }
-            #[cfg(not(unix))]
-            if !path
-                .components()
-                .map(|part| match part {
-                    std::path::Component::Normal(name) => name.to_str(),
-                    _ => None,
-                })
-                .eq(text.split('/').map(Some))
-            {
-                return false;
-            }
-            previous = Some(text);
-            true
+        // An exact byte-equal prefix of the last validated input is canonical.
+        // Reuse that validation even when a later path changes.
+        let unchanged_prefix = self.tree.as_ref().map_or(0, |_| {
+            self.paths
+                .iter()
+                .zip(&paths)
+                .take_while(|(old, new)| std::ffi::OsStr::new(old) == new.as_os_str())
+                .count()
         });
+        let unchanged_suffix = self.tree.as_ref().map_or(0, |_| {
+            self.paths
+                .iter()
+                .rev()
+                .zip(paths.iter().rev())
+                .take(paths.len().min(self.paths.len()) - unchanged_prefix)
+                .take_while(|(old, new)| std::ffi::OsStr::new(old) == new.as_os_str())
+                .count()
+        });
+        let mut previous = unchanged_prefix
+            .checked_sub(1)
+            .map(|index| self.paths[index].as_str());
+        let canonical = paths[unchanged_prefix..paths.len() - unchanged_suffix]
+            .iter()
+            .all(|path| {
+                let Some(text) = path.to_str() else {
+                    return false;
+                };
+                if text.is_empty()
+                    || text.contains('\0')
+                    || previous.is_some_and(|old| old >= text)
+                    || text
+                        .split('/')
+                        .any(|name| name.is_empty() || name == "." || name == "..")
+                {
+                    return false;
+                }
+                #[cfg(not(unix))]
+                if !path
+                    .components()
+                    .map(|part| match part {
+                        std::path::Component::Normal(name) => name.to_str(),
+                        _ => None,
+                    })
+                    .eq(text.split('/').map(Some))
+                {
+                    return false;
+                }
+                previous = Some(text);
+                true
+            })
+            && (unchanged_suffix == 0
+                || previous.is_none_or(|last| {
+                    last < self.paths[self.paths.len() - unchanged_suffix].as_str()
+                }));
         if !canonical {
             self.paths = Vec::new();
             self.tree = None;
@@ -163,6 +187,52 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_suffix_keeps_boundary_validation_and_fallback() {
+        let mut selection = FileSelection::default();
+        for middle in [
+            vec![],
+            vec!["a/one"],
+            vec!["z/last"],
+            vec!["zz/after"],
+            vec!["b//three"],
+            vec!["b/./three"],
+            vec!["b/../three"],
+            vec!["b/three\0"],
+            vec!["b/three", "c/four"],
+        ] {
+            selection.update(["a/one", "b/two", "z/last"]);
+            let paths: Vec<_> = ["a/one"]
+                .into_iter()
+                .chain(middle)
+                .chain(["z/last"])
+                .collect();
+            assert_eq!(selection.update(paths.clone()), filter::files(paths));
+            assert_eq!(selection.update(["z/last"]), filter::files(["z/last"]));
+        }
+    }
+
+    #[test]
+    fn unchanged_prefix_keeps_boundary_validation_and_fallback() {
+        let mut selection = FileSelection::default();
+        for suffix in [
+            vec![],
+            vec!["a/two"],
+            vec!["a/one"],
+            vec!["a//three"],
+            vec!["b/./three"],
+            vec!["b/../three"],
+            vec!["b/three\0"],
+            vec!["b/three", "b/three"],
+            vec!["b/three", "c/four"],
+        ] {
+            selection.update(["a/one", "a/two", "b/old"]);
+            let paths: Vec<_> = ["a/one", "a/two"].into_iter().chain(suffix).collect();
+            assert_eq!(selection.update(paths.clone()), filter::files(paths));
+            assert_eq!(selection.update(["a/one"]), filter::files(["a/one"]));
+        }
+    }
 
     #[test]
     fn incremental_insertions_and_removals_preserve_canonical_identity() {
