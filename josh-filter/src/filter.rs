@@ -376,7 +376,7 @@ where
     I: IntoIterator<Item = P>,
     P: Into<std::path::PathBuf>,
 {
-    use std::collections::BTreeMap;
+    use std::collections::HashMap;
     #[cfg(not(unix))]
     use std::path::Component;
     use std::path::PathBuf;
@@ -384,7 +384,7 @@ where
     #[derive(Default)]
     struct Paths<'a> {
         terminal: bool,
-        children: BTreeMap<&'a str, Paths<'a>>,
+        children: HashMap<&'a str, Paths<'a>>,
     }
     fn collect(paths: &[PathBuf]) -> Option<Paths<'_>> {
         let mut root = Paths::default();
@@ -422,13 +422,15 @@ where
         }
         Some(root)
     }
-    // Distinct sibling paths cannot overlap, so their BTreeMap order is the
-    // optimizer's source/destination order. Emit terminals before their descendants
+    // Distinct sibling paths cannot overlap. Sort them into the optimizer's
+    // source/destination order before emitting the filter. Emit terminals before their descendants
     // to preserve the accepted input order. Flatten single-child chains and
     // collapse singleton compositions to construct its normal form directly.
     fn build(paths: &Paths<'_>) -> Filter {
         let mut branches = Vec::new();
-        for (name, child) in &paths.children {
+        let mut children: Vec<_> = paths.children.iter().collect();
+        children.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        for (name, child) in children {
             if child.terminal {
                 branches.push(to_filter(Op::File((*name).into(), (*name).into())));
             }
