@@ -1028,8 +1028,16 @@ pub(super) fn select_identity_files<'a>(
         let mut builder =
             repo.treebuilder((selection == IdentitySelection::Remove).then_some(input))?;
         let mut changed = false;
+        let single_entry = input.len() == 1;
         for (name, selected) in &mut paths.children {
-            let Some(entry) = input.get_name(name) else {
+            let entry = if single_entry {
+                input
+                    .get(0)
+                    .filter(|entry| entry.name_bytes() == name.as_bytes())
+            } else {
+                input.get_name(name)
+            };
+            let Some(entry) = entry else {
                 continue;
             };
             if selected.terminal {
@@ -1259,6 +1267,58 @@ mod tests {
                     reference(repo, *left, *right),
                     "{left} intersect {right}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn single_entry_selection_preserves_exact_names_and_directory_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(directory.path()).unwrap();
+        let transaction = open_transaction(&directory);
+        let repo = transaction.repo();
+        let paths = [
+            "leaf",
+            "leaf-tail",
+            "leaf/child",
+            "folder/leaf",
+            "日本語",
+            "space name",
+            ".hidden",
+        ];
+        let queries = [
+            "leaf",
+            "leaf-tail",
+            "leaf/child",
+            "folder",
+            "folder/leaf",
+            "日本語",
+            "space name",
+            ".hidden",
+            "missing",
+        ];
+        for path in paths {
+            let source = make_tree(repo, &[path]);
+            let input = repo.find_tree(source).unwrap();
+            for query in queries {
+                let matches = path == query || path.starts_with(&format!("{query}/"));
+                for selection in [IdentitySelection::Keep, IdentitySelection::Remove] {
+                    let result = select_identity_files(
+                        &transaction,
+                        &input,
+                        &[Filter::new().file(query)],
+                        selection,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let retained = matches == (selection == IdentitySelection::Keep);
+                    assert_eq!(
+                        result.id(),
+                        if retained { source } else { empty_id() },
+                        "path={path}, query={query}, keep={}",
+                        selection == IdentitySelection::Keep
+                    );
+                }
             }
         }
     }
