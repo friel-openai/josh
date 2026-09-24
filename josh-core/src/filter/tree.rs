@@ -1021,7 +1021,7 @@ pub(super) fn select_identity_files<'a>(
             IdentitySelection::Remove => to_filter(Op::Exclude(keep)),
         };
         if let Some(output) = transaction.get_apply(key, input.id())
-            && repo.find_tree(output).is_ok()
+            && (output == input.id() || repo.find_tree(output).is_ok())
         {
             return Ok(Some(output));
         }
