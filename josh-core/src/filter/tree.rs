@@ -1008,11 +1008,12 @@ pub(super) fn select_identity_files<'a>(
         paths.cache_filter = Some(keep);
         keep
     }
-    fn select(
-        transaction: &cache::Transaction,
+    fn select<'repo>(
+        transaction: &'repo cache::Transaction,
         input: &git2::Tree<'_>,
         paths: &mut IdentityPaths,
         selection: IdentitySelection,
+        builders: &mut Vec<git2::TreeBuilder<'repo>>,
     ) -> anyhow::Result<Option<git2::Oid>> {
         let repo = transaction.repo();
         let keep = prepare(paths);
@@ -1028,7 +1029,10 @@ pub(super) fn select_identity_files<'a>(
         // Exclusions often leave a subtree unchanged. Copy its entries into a
         // builder only after finding an entry that actually needs to change.
         let mut builder = match selection {
-            IdentitySelection::Keep => Some(repo.treebuilder(None)?),
+            IdentitySelection::Keep => Some(match builders.pop() {
+                Some(builder) => builder,
+                None => repo.treebuilder(None)?,
+            }),
             IdentitySelection::Remove => None,
         };
         for (name, selected) in &mut paths.children {
@@ -1057,7 +1061,8 @@ pub(super) fn select_identity_files<'a>(
                 }
             } else if entry.kind() == Some(git2::ObjectType::Tree) {
                 let subtree = repo.find_tree(entry.id())?;
-                let Some(output) = select(transaction, &subtree, selected, selection)? else {
+                let Some(output) = select(transaction, &subtree, selected, selection, builders)?
+                else {
                     return Ok(None);
                 };
                 if selection == IdentitySelection::Remove && output == entry.id() {
@@ -1074,13 +1079,22 @@ pub(super) fn select_identity_files<'a>(
             }
         }
         let output = match builder {
-            Some(builder) => builder.write()?,
+            Some(mut builder) => {
+                let output = builder.write()?;
+                if selection == IdentitySelection::Keep {
+                    // Keep builders start empty. Reuse their map and serialization
+                    // buffers for siblings, only within this selection call.
+                    builder.clear()?;
+                    builders.push(builder);
+                }
+                output
+            }
             None => input.id(),
         };
         transaction.insert_apply(key, input.id(), output);
         Ok(Some(output))
     }
-    let selected = select(transaction, input, &mut paths, selection);
+    let selected = select(transaction, input, &mut paths, selection, &mut Vec::new());
     transaction.insert_identity_paths(cache_key, paths);
     selected?
         .map(|oid| repo.find_tree(oid).map_err(Into::into))
@@ -1374,6 +1388,46 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(actual.id(), expected);
+    }
+
+    #[test]
+    fn identity_file_selection_keeps_sibling_entries_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let mut source_paths = Vec::new();
+        let mut selected_paths = Vec::new();
+        for index in 0..24 {
+            let selected = format!("directory-{index:02}/nested/keep-{index:02}");
+            source_paths.push(selected.clone());
+            selected_paths.push(selected);
+            source_paths.push(format!("directory-{index:02}/nested/drop-{index:02}"));
+            if index % 3 == 0 {
+                let selected = format!("directory-{index:02}/other/deeper/leaf");
+                source_paths.push(selected.clone());
+                selected_paths.push(selected);
+            }
+        }
+        let source = make_tree(
+            &repo,
+            &source_paths.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let expected = make_tree(
+            &repo,
+            &selected_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        let transaction = open_transaction(&directory);
+        let input = transaction.repo().find_tree(source).unwrap();
+        let filters: Vec<_> = selected_paths
+            .iter()
+            .map(|path| to_filter(Op::File(path.into(), path.into())))
+            .collect();
+        let actual = select_identity_files(&transaction, &input, &filters, IdentitySelection::Keep)
+            .unwrap()
+            .unwrap();
         assert_eq!(actual.id(), expected);
     }
 
