@@ -1218,8 +1218,7 @@ pub fn apply<'a>(
     x: Rewrite<'a>,
 ) -> anyhow::Result<Rewrite<'a>> {
     let repo = transaction.repo();
-    let op = peel_op(filter);
-    match &op {
+    match josh_filter::persist::peel_op_ref(filter) {
         Op::Nop => Ok(x),
         Op::Empty => Ok(x.with_tree(tree::empty(repo))),
         Op::Fold => Ok(x),
