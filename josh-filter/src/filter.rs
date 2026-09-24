@@ -380,36 +380,47 @@ where
     use std::path::Component;
     use std::path::PathBuf;
 
-    // Sort component references instead of allocating a map node for every
-    // directory/file. Original positions preserve ancestor overlay ordering.
-    fn build(paths: &[(&str, usize)]) -> Option<Filter> {
-        let mut components: Vec<_> = paths
-            .iter()
-            .map(|(path, position)| {
-                let (name, rest) = path
-                    .split_once('/')
-                    .map_or((*path, None), |(name, rest)| (name, Some(rest)));
-                (name, rest, *position)
-            })
-            .collect();
-        components.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    struct ComponentPath<'a> {
+        name: &'a str,
+        rest: Option<&'a str>,
+        position: usize,
+    }
+    fn split(path: &str, position: usize) -> ComponentPath<'_> {
+        let (name, rest) = path
+            .split_once('/')
+            .map_or((path, None), |(name, rest)| (name, Some(rest)));
+        ComponentPath {
+            name,
+            rest,
+            position,
+        }
+    }
+    // Reuse one temporary array while descending. Only component references
+    // change; original paths and positions remain available for ordered fallback.
+    fn build(paths: &mut [ComponentPath<'_>]) -> Option<Filter> {
+        paths.sort_unstable_by(|a, b| a.name.cmp(b.name));
         let mut branches = Vec::new();
-        for group in components.chunk_by(|a, b| a.0 == b.0) {
-            let name = group[0].0;
-            let mut terminals = group.iter().filter(|(_, rest, _)| rest.is_none());
-            if let Some((_, _, position)) = terminals.next() {
-                if terminals.next().is_some() || group.iter().any(|(_, _, index)| index < position)
-                {
-                    return None;
-                }
-                branches.push(to_filter(Op::File(name.into(), name.into())));
-            }
-            let descendants: Vec<_> = group
-                .iter()
-                .filter_map(|(_, rest, position)| rest.map(|rest| (rest, *position)))
-                .collect();
+        for group in paths.chunk_by_mut(|a, b| a.name == b.name) {
+            let name = group[0].name;
+            let descendants =
+                if let Some(terminal) = group.iter().position(|path| path.rest.is_none()) {
+                    let position = group[terminal].position;
+                    if group.iter().filter(|path| path.rest.is_none()).count() != 1
+                        || group.iter().any(|path| path.position < position)
+                    {
+                        return None;
+                    }
+                    branches.push(to_filter(Op::File(name.into(), name.into())));
+                    group.swap(0, terminal);
+                    &mut group[1..]
+                } else {
+                    group
+                };
             if !descendants.is_empty() {
-                let inner = build(&descendants)?;
+                for path in descendants.iter_mut() {
+                    *path = split(path.rest?, path.position);
+                }
+                let inner = build(descendants)?;
                 let mut chain = vec![to_filter(Op::Subdir(name.into()))];
                 match persist::to_op_ref(inner) {
                     Op::Chain(nested) => chain.extend(nested.iter().copied()),
@@ -449,10 +460,10 @@ where
             {
                 return None;
             }
-            Some((text, position))
+            Some(split(text, position))
         })
         .collect();
-    if let Some(grouped) = canonical.and_then(|paths| build(&paths)) {
+    if let Some(grouped) = canonical.and_then(|mut paths| build(&mut paths)) {
         grouped
     } else {
         compose(
