@@ -1190,16 +1190,21 @@ fn write_selected_entries(
         }
         return Ok(builder.write()?);
     }
-    let entries = entries
-        .into_iter()
-        .map(|(name, oid, mode)| gix_object::tree::Entry {
-            mode: gix_object::tree::EntryMode::try_from(mode as u32)
+    use gix_object::WriteTo;
+    let mut borrowed: Vec<_> = entries
+        .iter()
+        .map(|(name, oid, mode)| gix_object::tree::EntryRef {
+            mode: gix_object::tree::EntryMode::try_from(*mode as u32)
                 .expect("validated canonical tree mode"),
-            filename: name.into(),
-            oid: objects::gix_oid(oid),
+            filename: name.as_bytes().into(),
+            oid: gix_hash::oid::try_from_bytes(oid.as_bytes()).expect("git2 OIDs are 20 bytes"),
         })
         .collect();
-    objects::write_tree_now(&repo.odb()?, entries)
+    borrowed.sort();
+    let tree = gix_object::TreeRef { entries: borrowed };
+    let mut buffer = Vec::with_capacity(tree.size() as usize);
+    tree.write_to(&mut buffer)?;
+    Ok(repo.odb()?.write(git2::ObjectType::Tree, &buffer)?)
 }
 
 #[cfg(test)]
