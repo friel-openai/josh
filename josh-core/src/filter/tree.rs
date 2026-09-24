@@ -1146,7 +1146,9 @@ pub fn get_blob(repo: &git2::Repository, tree: &git2::Tree, path: &Path) -> Stri
 }
 
 pub fn empty_id() -> git2::Oid {
-    git2::Oid::from_str("4b825dc642cb6eb9a060e54bf8d69288fbee4904").unwrap()
+    static ID: LazyLock<git2::Oid> =
+        LazyLock::new(|| git2::Oid::from_str("4b825dc642cb6eb9a060e54bf8d69288fbee4904").unwrap());
+    *ID
 }
 
 pub fn empty(repo: &git2::Repository) -> git2::Tree<'_> {
