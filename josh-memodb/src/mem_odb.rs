@@ -218,6 +218,16 @@ impl OdbBackend for MemBackend {
             .ok_or_else(not_found)
     }
 
+    fn read_with(
+        &self,
+        oid: Oid,
+        receive: &mut dyn FnMut(&[u8], ObjectType) -> Result<(), git2::Error>,
+    ) -> Result<(), git2::Error> {
+        let inner = self.store.inner.lock().unwrap();
+        let (kind, data) = inner.map.get(&oid).ok_or_else(not_found)?;
+        receive(data, raw_to_kind(*kind))
+    }
+
     fn write(&mut self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error> {
         let overflow = self.store.insert(oid, kind.raw(), data.into_boxed_slice());
         if overflow {
@@ -244,6 +254,44 @@ fn raw_to_kind(kind: raw::git_object_t) -> ObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_reads_preserve_bytes_and_receiver_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let store = MemOdb::new(None, repo.path().to_owned());
+        store.register(&repo);
+        let backend = MemBackend {
+            store: store.clone(),
+        };
+        for contents in [Vec::new(), vec![0x5a; 1024 * 1024]] {
+            let oid = Oid::hash_object(ObjectType::Blob, &contents).unwrap();
+            store.insert(
+                oid,
+                ObjectType::Blob.raw(),
+                contents.clone().into_boxed_slice(),
+            );
+            let mut calls = 0;
+            let error = backend
+                .read_with(oid, &mut |bytes, kind| {
+                    calls += 1;
+                    assert_eq!(bytes, contents);
+                    assert_eq!(kind, ObjectType::Blob);
+                    Err(git2::Error::from_str("receiver failed"))
+                })
+                .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(error.message(), "receiver failed");
+            // A failed receiver must release the lock and leave bytes available.
+            assert_eq!(repo.odb().unwrap().read(oid).unwrap().data(), contents);
+        }
+        let error = backend
+            .read_with(Oid::zero(), &mut |_, _| {
+                panic!("missing objects must not call the receiver")
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NotFound);
+    }
 
     /// Objects written through a registered [`MemOdb`] are visible only in memory until flushed;
     /// after a flush a fresh repository (no backend) must find them on disk.

@@ -34,6 +34,17 @@ use libgit2_sys as raw;
 pub trait OdbBackend {
     fn read_header(&self, oid: Oid) -> Result<(usize, ObjectType), git2::Error>;
     fn read(&self, oid: Oid) -> Result<(Vec<u8>, ObjectType), git2::Error>;
+    /// Pass one object's bytes to `receive`, avoiding an intermediate owned copy
+    /// when a backend can borrow its storage. Invoke the receiver exactly once on
+    /// success, and propagate its result. The receiver must not reenter this backend.
+    fn read_with(
+        &self,
+        oid: Oid,
+        receive: &mut dyn FnMut(&[u8], ObjectType) -> Result<(), git2::Error>,
+    ) -> Result<(), git2::Error> {
+        let (data, kind) = self.read(oid)?;
+        receive(&data, kind)
+    }
     /// A duplicate (content-addressed) `oid` may be treated as a no-op.
     fn write(&mut self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error>;
     fn exists(&self, oid: Oid) -> bool;
@@ -68,19 +79,22 @@ impl RawOdbBackend {
         oid: *const raw::git_oid,
     ) -> c_int {
         let (wrapper, roid) = unsafe { (RawOdbBackend::from_raw(backend), oid_from_raw(oid)) };
-        match wrapper.obj.read(roid) {
-            Ok((data, kind)) => unsafe {
-                let len = data.len();
-                let buf = raw::git_odb_backend_data_alloc(backend, len);
-                if buf.is_null() {
-                    return raw::GIT_ERROR;
-                }
-                ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, len);
-                *data_p = buf;
-                *len_p = len;
-                *kind_p = kind.raw();
-                raw::GIT_OK
-            },
+        let mut receive = |data: &[u8], kind: ObjectType| unsafe {
+            let len = data.len();
+            let buf = raw::git_odb_backend_data_alloc(backend, len);
+            if buf.is_null() {
+                return Err(git2::Error::from_str(
+                    "could not allocate object read buffer",
+                ));
+            }
+            ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, len);
+            *data_p = buf;
+            *len_p = len;
+            *kind_p = kind.raw();
+            Ok(())
+        };
+        match wrapper.obj.read_with(roid, &mut receive) {
+            Ok(()) => raw::GIT_OK,
             Err(err) if is_not_found(&err) && !wrapper.delegate.is_null() => unsafe {
                 // Memory miss: read through to the original on-disk ODB and copy its bytes into a
                 // backend-owned buffer (libgit2 frees `*data_p` via the backend's allocator).
