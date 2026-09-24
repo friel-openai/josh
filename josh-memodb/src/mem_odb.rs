@@ -205,7 +205,7 @@ impl OdbBackend for MemBackend {
             .ok_or_else(not_found)
     }
 
-    fn write(&mut self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error> {
+    fn write(&self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error> {
         let overflow = self.store.insert(oid, kind.raw(), data.into_boxed_slice());
         if overflow {
             self.store.enqueue_chunk();
