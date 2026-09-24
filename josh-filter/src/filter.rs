@@ -427,18 +427,20 @@ where
     // to preserve the accepted input order. Flatten single-child chains and
     // collapse singleton compositions to construct its normal form directly.
     fn build(paths: &Paths<'_>) -> Filter {
-        let mut branches = Vec::new();
+        let mut branches = Vec::with_capacity(paths.children.len());
         for (name, child) in &paths.children {
             if child.terminal {
                 branches.push(to_filter(Op::File((*name).into(), (*name).into())));
             }
             if !child.children.is_empty() {
                 let inner = build(child);
-                let mut chain = vec![to_filter(Op::Subdir((*name).into()))];
-                match persist::to_op_ref(inner) {
-                    Op::Chain(nested) => chain.extend(nested.iter().copied()),
-                    _ => chain.push(inner),
-                }
+                let nested = match persist::to_op_ref(inner) {
+                    Op::Chain(nested) => nested.as_slice(),
+                    _ => std::slice::from_ref(&inner),
+                };
+                let mut chain = Vec::with_capacity(nested.len() + 2);
+                chain.push(to_filter(Op::Subdir((*name).into())));
+                chain.extend_from_slice(nested);
                 chain.push(to_filter(Op::Prefix((*name).into())));
                 branches.push(opt::remember_optimized(to_filter(Op::Chain(chain))));
             }
