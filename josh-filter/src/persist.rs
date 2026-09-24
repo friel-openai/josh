@@ -18,7 +18,7 @@ pub(crate) struct Node {
 /// Canonicalizes each `Op` to a single interned node by structural equality, so equal `Op`s
 /// map to the same node (and therefore the same `Filter` pointer). `Op` derives `Hash`/`Eq`
 /// and its child `Filter`s hash/compare by pointer, so the `Op` itself is the key.
-static INTERN: LazyLock<std::sync::Mutex<HashMap<Op, &'static Node>>> =
+static INTERN: LazyLock<std::sync::Mutex<HashMap<&'static Op, &'static Node>>> =
     LazyLock::new(Default::default);
 
 pub fn peel_op(filter: Filter) -> Op {
@@ -572,17 +572,18 @@ impl<'a> InMemoryBuilder<'a> {
 
 // Canonicalize an `Op` to its single interned node via structural equality. On a hit we
 // return the existing node and drop `op`; on a miss we leak a node (its `Op` lives for the
-// process) and key it by a clone of the `Op`.
+// process) and borrow its immutable `Op` as the key. This avoids duplicating
+// every path/vector and keeps the hash-table entries small.
 fn intern(op: Op) -> &'static Node {
     let mut intern = INTERN.lock().unwrap();
     if let Some(node) = intern.get(&op) {
         return node;
     }
     let node: &'static Node = Box::leak(Box::new(Node {
-        op: op.clone(),
+        op,
         oid: OnceLock::new(),
     }));
-    intern.insert(op, node);
+    intern.insert(&node.op, node);
     node
 }
 
@@ -1173,5 +1174,42 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> anyhow::Result<Op
             Ok(Op::Meta(meta, to_filter(filter)))
         }
         _ => Err(anyhow!("Unknown tree structure")),
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn interning_preserves_identity_across_threads_and_oid_initialization() {
+        fn composition() -> Filter {
+            let files = (0..64)
+                .map(|index| {
+                    let path = std::path::PathBuf::from(format!("intern-test/{index}/file"));
+                    to_filter(Op::File(path.clone(), path))
+                })
+                .collect();
+            to_filter(Op::Compose(files))
+        }
+        let original = composition();
+        let expected_oid = original.id();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    for _ in 0..128 {
+                        let rebuilt = composition();
+                        assert_eq!(rebuilt, original);
+                        assert_eq!(rebuilt.id(), expected_oid);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let plain_noop = to_filter(Op::Nop);
+        assert_ne!(sentinel(git2::Oid::zero()), plain_noop);
+        assert_eq!(plain_noop, to_filter(Op::Nop));
     }
 }
