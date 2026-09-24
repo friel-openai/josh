@@ -588,7 +588,15 @@ fn intern(op: Op) -> &'static Node {
 }
 
 pub fn to_filter(op: Op) -> Filter {
-    Filter(intern(op))
+    // These canonical nodes are immutable and already live for the process.
+    // Repeated optimizer checks need not lock and search the interner again.
+    static NOP: LazyLock<Filter> = LazyLock::new(|| Filter(intern(Op::Nop)));
+    static EMPTY: LazyLock<Filter> = LazyLock::new(|| Filter(intern(Op::Empty)));
+    match op {
+        Op::Nop => *NOP,
+        Op::Empty => *EMPTY,
+        op => Filter(intern(op)),
+    }
 }
 
 /// Materialize a node's content OID, building its tree (and, recursively via `build_op`'s child
