@@ -426,20 +426,20 @@ where
     // optimizer's source/destination order. Emit terminals before their descendants
     // to preserve the accepted input order. Flatten single-child chains and
     // collapse singleton compositions to construct its normal form directly.
-    fn build(paths: &Paths<'_>) -> Filter {
+    fn build(paths: Paths<'_>) -> Filter {
         let mut branches = Vec::new();
-        for (name, child) in &paths.children {
+        for (name, child) in paths.children {
             if child.terminal {
-                branches.push(to_filter(Op::File((*name).into(), (*name).into())));
+                branches.push(to_filter(Op::File(name.into(), name.into())));
             }
             if !child.children.is_empty() {
                 let inner = build(child);
-                let mut chain = vec![to_filter(Op::Subdir((*name).into()))];
+                let mut chain = vec![to_filter(Op::Subdir(name.into()))];
                 match persist::to_op_ref(inner) {
                     Op::Chain(nested) => chain.extend(nested.iter().copied()),
                     _ => chain.push(inner),
                 }
-                chain.push(to_filter(Op::Prefix((*name).into())));
+                chain.push(to_filter(Op::Prefix(name.into())));
                 branches.push(opt::remember_optimized(to_filter(Op::Chain(chain))));
             }
         }
@@ -451,7 +451,7 @@ where
     }
     let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
     if let Some(grouped) = collect(&paths) {
-        build(&grouped)
+        build(grouped)
     } else {
         compose(
             &paths
