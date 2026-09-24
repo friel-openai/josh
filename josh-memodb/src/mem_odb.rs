@@ -126,7 +126,9 @@ impl MemOdb {
         // across the packbuilder below: `pb.write` reads each one back through the odb -> this
         // backend -> `self.inner.lock()`, so we can neither hold the lock here (self-deadlock) nor
         // drain the map before the pack is on disk. A BTreeMap iterates in sorted oid order, so the
-        // packbuilder produces a deterministic packfile (hence a deterministic pack name).
+        // default single-threaded packbuilder produces a deterministic packfile. An explicit
+        // parallel pack.threads setting can change delta choices and physical pack names,
+        // but never object ids or the durability boundary.
         let oids: Vec<Oid> = {
             let inner = self.inner.lock().unwrap();
             if inner.map.is_empty() {
@@ -141,10 +143,21 @@ impl MemOdb {
         // The memory-only freshen (see `odb_backend`) no longer deduplicates writes against disk,
         // so objects already present on disk may have been re-buffered into the store. Pack only the
         // genuinely-new ones — `filter_absent_on_disk` preserves the sorted oid order, so the
-        // packfile (and its name) stays deterministic.
+        // default single-threaded packfile (and its name) stays deterministic.
         let to_pack = odb_backend::filter_absent_on_disk(&repo, &oids);
         if !to_pack.is_empty() {
             let mut pb = repo.packbuilder()?;
+            // libgit2 defaults to one worker and does not read Git's pack.threads.
+            // Preserve that default unless the repository explicitly opts in.
+            match repo.config()?.get_i32("pack.threads") {
+                Ok(threads) => {
+                    let threads = u32::try_from(threads)
+                        .map_err(|_| git2::Error::from_str("pack.threads must be nonnegative"))?;
+                    pb.set_threads(threads);
+                }
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+                Err(error) => return Err(error),
+            }
             for oid in &to_pack {
                 pb.insert_object(*oid, None)?;
             }
@@ -262,6 +275,40 @@ mod tests {
 
         // The store is drained: a second flush is a no-op.
         store.flush().unwrap();
+    }
+
+    #[test]
+    fn configured_pack_threads_preserve_objects_and_failed_flush_can_retry() {
+        for threads in [1, 4, -1] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init_bare(directory.path()).unwrap();
+            repo.config()
+                .unwrap()
+                .set_i32("pack.threads", threads)
+                .unwrap();
+            let store = MemOdb::new(None, repo.path().to_owned());
+            store.register(&repo);
+            let contents: Vec<_> = (0..200)
+                .map(|index| format!("{}-{index}", "similar packed content".repeat(100)))
+                .collect();
+            let ids: Vec<_> = contents
+                .iter()
+                .map(|content| repo.blob(content.as_bytes()).unwrap())
+                .collect();
+            if threads < 0 {
+                assert!(store.flush().is_err());
+                // A failed pack must leave the buffered objects available to retry.
+                for id in &ids {
+                    assert!(repo.odb().unwrap().exists(*id));
+                }
+                repo.config().unwrap().set_i32("pack.threads", 4).unwrap();
+            }
+            store.flush().unwrap();
+            let fresh = git2::Repository::open_bare(directory.path()).unwrap();
+            for (id, content) in ids.iter().zip(&contents) {
+                assert_eq!(fresh.find_blob(*id).unwrap().content(), content.as_bytes());
+            }
+        }
     }
 
     /// A linked worktree's gitdir has no `objects/` of its own, so the flush must write into the
