@@ -369,7 +369,8 @@ pub fn compose(filters: &[Filter]) -> Filter {
 /// Select exact file paths, like composing one `Filter::new().file(path)` per path.
 /// Build the canonical shared directory structure directly to avoid constructing and
 /// simplifying a complete ancestor chain independently for every file. Filter IDs
-/// remain canonical. Noncanonical, duplicate and overlapping paths use composition.
+/// remain canonical. Ancestors may precede their descendants; other overlaps,
+/// duplicates and noncanonical paths use composition.
 pub fn files<I, P>(paths: I) -> Filter
 where
     I: IntoIterator<Item = P>,
@@ -404,11 +405,10 @@ where
             }
             let mut node = &mut root;
             for component in text.split('/') {
-                if node.terminal {
-                    return None;
-                }
                 node = node.children.entry(component).or_default();
             }
+            // Keep ancestor-before-descendant overlay order. Reversed overlaps
+            // and duplicate entries still use the general optimizer.
             if node.terminal || !node.children.is_empty() {
                 return None;
             }
@@ -417,27 +417,26 @@ where
         Some(root)
     }
     // Distinct sibling paths cannot overlap, so their BTreeMap order is the
-    // optimizer's source/destination order. Flatten single-child chains and
+    // optimizer's source/destination order. Emit terminals before their descendants
+    // to preserve the accepted input order. Flatten single-child chains and
     // collapse singleton compositions to construct its normal form directly.
     fn build(paths: &Paths<'_>) -> Filter {
-        let branches: Vec<_> = paths
-            .children
-            .iter()
-            .map(|(name, child)| {
-                if child.terminal {
-                    to_filter(Op::File((*name).into(), (*name).into()))
-                } else {
-                    let inner = build(child);
-                    let mut chain = vec![to_filter(Op::Subdir((*name).into()))];
-                    match persist::to_op_ref(inner) {
-                        Op::Chain(nested) => chain.extend(nested.iter().copied()),
-                        _ => chain.push(inner),
-                    }
-                    chain.push(to_filter(Op::Prefix((*name).into())));
-                    opt::remember_optimized(to_filter(Op::Chain(chain)))
+        let mut branches = Vec::new();
+        for (name, child) in &paths.children {
+            if child.terminal {
+                branches.push(to_filter(Op::File((*name).into(), (*name).into())));
+            }
+            if !child.children.is_empty() {
+                let inner = build(child);
+                let mut chain = vec![to_filter(Op::Subdir((*name).into()))];
+                match persist::to_op_ref(inner) {
+                    Op::Chain(nested) => chain.extend(nested.iter().copied()),
+                    _ => chain.push(inner),
                 }
-            })
-            .collect();
+                chain.push(to_filter(Op::Prefix((*name).into())));
+                branches.push(opt::remember_optimized(to_filter(Op::Chain(chain))));
+            }
+        }
         match branches.as_slice() {
             [] => to_filter(Op::Empty),
             [only] => *only,
@@ -585,6 +584,47 @@ mod file_builder_tests {
             let actual = files(paths);
             assert_eq!(actual, expected, "shape {case}");
             assert_eq!(actual.id(), expected.id());
+        }
+    }
+
+    #[test]
+    fn bulk_files_preserve_ordered_and_reversed_overlap_identities() {
+        let candidates = [
+            "a",
+            "a-b",
+            "a-b/x",
+            "a.b/x",
+            "a/one",
+            "a/one/deep",
+            "a/two",
+            "b",
+            "b/é",
+            "b/é/日本語",
+        ];
+        for subset in 0..(1 << candidates.len()) {
+            let selected: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| subset & (1 << index) != 0)
+                .map(|(_, path)| *path)
+                .collect();
+            for order in 0..3 {
+                let mut paths = selected.clone();
+                match order {
+                    0 => paths.sort(),
+                    1 => paths.sort_by(|a, b| b.cmp(a)),
+                    _ => paths.sort_by_key(|p| p.len()),
+                }
+                let expected = compose(
+                    &paths
+                        .iter()
+                        .map(|path| Filter::new().file(*path))
+                        .collect::<Vec<_>>(),
+                );
+                let actual = files(paths);
+                assert_eq!(actual, expected, "subset {subset}, order {order}");
+                assert_eq!(actual.id(), expected.id());
+            }
         }
     }
 
