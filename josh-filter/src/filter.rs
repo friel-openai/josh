@@ -367,7 +367,7 @@ pub fn compose(filters: &[Filter]) -> Filter {
 }
 
 /// Select exact file paths, like composing one `Filter::new().file(path)` per path.
-/// Build shared directory structure before optimization to avoid constructing and
+/// Build the canonical shared directory structure directly to avoid constructing and
 /// simplifying a complete ancestor chain independently for every file. Filter IDs
 /// remain canonical. Noncanonical, duplicate and overlapping paths use composition.
 pub fn files<I, P>(paths: I) -> Filter
@@ -416,27 +416,37 @@ where
         }
         Some(root)
     }
+    // Distinct sibling paths cannot overlap, so their BTreeMap order is the
+    // optimizer's source/destination order. Flatten single-child chains and
+    // collapse singleton compositions to construct its normal form directly.
     fn build(paths: &Paths<'_>) -> Filter {
-        let branches = paths
+        let branches: Vec<_> = paths
             .children
             .iter()
             .map(|(name, child)| {
                 if child.terminal {
                     to_filter(Op::File((*name).into(), (*name).into()))
                 } else {
-                    to_filter(Op::Chain(vec![
-                        to_filter(Op::Subdir((*name).into())),
-                        build(child),
-                        to_filter(Op::Prefix((*name).into())),
-                    ]))
+                    let inner = build(child);
+                    let mut chain = vec![to_filter(Op::Subdir((*name).into()))];
+                    match persist::to_op_ref(inner) {
+                        Op::Chain(nested) => chain.extend(nested.iter().copied()),
+                        _ => chain.push(inner),
+                    }
+                    chain.push(to_filter(Op::Prefix((*name).into())));
+                    to_filter(Op::Chain(chain))
                 }
             })
             .collect();
-        to_filter(Op::Compose(branches))
+        match branches.as_slice() {
+            [] => to_filter(Op::Empty),
+            [only] => *only,
+            _ => to_filter(Op::Compose(branches)),
+        }
     }
     let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
     if let Some(grouped) = collect(&paths) {
-        opt::optimize(build(&grouped))
+        build(&grouped)
     } else {
         compose(
             &paths
@@ -491,11 +501,11 @@ mod file_builder_tests {
             "unicode/日本語",
             "a-b/x",
         ];
-        for seed in 0..128 {
+        for seed in 0..(1 << candidates.len()) {
             let mut paths: Vec<_> = candidates
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| (index * 7 + seed * 13) % 11 < 7)
+                .filter(|(index, _)| seed & (1 << index) != 0)
                 .map(|(_, path)| *path)
                 .collect();
             if seed % 2 == 0 {
@@ -534,6 +544,47 @@ mod file_builder_tests {
                         .collect::<Vec<_>>()
                 )
             );
+        }
+    }
+
+    #[test]
+    fn bulk_files_match_composition_on_varied_directory_shapes() {
+        let components = [
+            "a",
+            "a-b",
+            "a.b",
+            "x",
+            "y",
+            "é",
+            "日本語",
+            "space name",
+            "[literal]",
+        ];
+        let mut state = 17_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state >> 32
+        };
+        for case in 0..256 {
+            let mut paths = Vec::new();
+            for _ in 0..32 {
+                let depth = 1 + next() % 6;
+                paths.push(
+                    (0..depth)
+                        .map(|_| components[next() as usize % components.len()])
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                );
+            }
+            let expected = compose(
+                &paths
+                    .iter()
+                    .map(|path| Filter::new().file(path))
+                    .collect::<Vec<_>>(),
+            );
+            let actual = files(paths);
+            assert_eq!(actual, expected, "shape {case}");
+            assert_eq!(actual.id(), expected.id());
         }
     }
 }
