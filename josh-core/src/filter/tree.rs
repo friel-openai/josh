@@ -871,11 +871,13 @@ pub(super) enum IdentitySelection {
 /// Returning None keeps the general composition semantics for renames and metadata.
 /// The filter itself is unchanged, including its persistent cache key.
 pub(super) fn select_identity_files<'a>(
-    repo: &'a git2::Repository,
+    transaction: &'a cache::Transaction,
     input: &git2::Tree<'a>,
+    filter: Filter,
     filters: &[Filter],
     selection: IdentitySelection,
 ) -> anyhow::Result<Option<git2::Tree<'a>>> {
+    let repo = transaction.repo();
     // Filter nodes are immutable and interned. Borrow path components rather than
     // cloning every path each time a tree is selected.
     #[derive(Default)]
@@ -939,6 +941,13 @@ pub(super) fn select_identity_files<'a>(
             return Ok(None);
         }
     }
+    // Only recognized identity selections may reuse a tree-only result.
+    // Metadata and other general filters must continue through normal apply.
+    if let Some(output) = transaction.get_apply(filter, input.id())
+        && let Ok(tree) = repo.find_tree(output)
+    {
+        return Ok(Some(tree));
+    }
     fn select(
         repo: &git2::Repository,
         input: &git2::Tree<'_>,
@@ -988,7 +997,11 @@ pub(super) fn select_identity_files<'a>(
         }
         Ok(Some(builder.write()?))
     }
-    select(repo, input, &paths, selection)?
+    let output = select(repo, input, &paths, selection)?;
+    if let Some(output) = output {
+        transaction.insert_apply(filter, input.id(), output);
+    }
+    output
         .map(|oid| repo.find_tree(oid).map_err(Into::into))
         .transpose()
 }
@@ -1100,6 +1113,31 @@ mod tests {
     }
 
     #[test]
+    fn identity_tree_cache_preserves_metadata_and_rebuilds_missing_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let source = make_tree(&repo, &["a", "b", "c"]);
+        let expected = make_tree(&repo, &["a", "b"]);
+        let transaction = open_transaction(&directory);
+        let selection = crate::filter::files(["a", "b"]);
+        for message in ["first commit", "second commit"] {
+            let input = Rewrite::from_tree(transaction.repo().find_tree(source).unwrap())
+                .with_message(message.to_owned());
+            let result = apply(&transaction, selection, input).unwrap();
+            assert_eq!(result.tree().id(), expected);
+            assert_eq!(result.message.as_deref(), Some(message));
+            assert_eq!(transaction.get_apply(selection, source), Some(expected));
+        }
+        transaction.insert_apply(selection, source, git2::Oid::zero());
+        let input = Rewrite::from_tree(transaction.repo().find_tree(source).unwrap());
+        assert_eq!(
+            apply(&transaction, selection, input).unwrap().tree().id(),
+            expected
+        );
+        assert_eq!(transaction.get_apply(selection, source), Some(expected));
+    }
+
+    #[test]
     fn identity_file_selection_matches_general_compose() {
         let directory = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(directory.path()).unwrap();
@@ -1193,8 +1231,9 @@ mod tests {
                 .unwrap()
                 .id();
             let actual = select_identity_files(
-                transaction.repo(),
+                &transaction,
                 &input,
+                to_filter(Op::Compose(filters.clone())),
                 &filters,
                 IdentitySelection::Keep,
             )
@@ -1205,8 +1244,9 @@ mod tests {
             let excluded = subtract(&transaction, source, expected).unwrap();
             assert_eq!(
                 select_identity_files(
-                    transaction.repo(),
+                    &transaction,
                     &input,
+                    to_filter(Op::Exclude(to_filter(Op::Compose(filters.clone())))),
                     &filters,
                     IdentitySelection::Remove
                 )
@@ -1235,8 +1275,9 @@ mod tests {
         ] {
             assert!(
                 select_identity_files(
-                    transaction.repo(),
+                    &transaction,
                     &input,
+                    to_filter(Op::Compose(filters.clone())),
                     &filters,
                     IdentitySelection::Keep
                 )
