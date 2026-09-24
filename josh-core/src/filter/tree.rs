@@ -689,13 +689,13 @@ pub fn overlay(
     input1: git2::Oid,
     input2: git2::Oid,
 ) -> anyhow::Result<git2::Oid> {
+    if input1 == input2 {
+        return Ok(input1);
+    }
     if let Some(cached) = transaction.get_overlay((input1, input2)) {
         return Ok(cached);
     }
     let repo = transaction.repo();
-    if input1 == input2 {
-        return Ok(input1);
-    }
     if input1 == empty_id() {
         return Ok(input2);
     }
