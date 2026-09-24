@@ -31,11 +31,13 @@ use libgit2_sys as raw;
 /// [`git2::Oid`] / [`git2::ObjectType`] and return [`git2::Error`] so any libgit2 failure code can
 /// be signalled: signal "not present here" with [`git2::ErrorCode::NotFound`], which the trampoline
 /// forwards to the on-disk delegate. Any other error code propagates and aborts the lookup.
-pub trait OdbBackend {
+// libgit2 may invoke read callbacks concurrently, including packbuilder workers.
+// Backends synchronize mutable state internally rather than borrowing it exclusively.
+pub trait OdbBackend: Send + Sync {
     fn read_header(&self, oid: Oid) -> Result<(usize, ObjectType), git2::Error>;
     fn read(&self, oid: Oid) -> Result<(Vec<u8>, ObjectType), git2::Error>;
     /// A duplicate (content-addressed) `oid` may be treated as a no-op.
-    fn write(&mut self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error>;
+    fn write(&self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error>;
     fn exists(&self, oid: Oid) -> bool;
     /// Resolve an abbreviated object id to its full [`Oid`], if this backend holds a unique match.
     fn exists_prefix(&self, oid: Oid, oid_len: usize) -> Option<Oid>;
@@ -56,8 +58,10 @@ struct RawOdbBackend {
 impl RawOdbBackend {
     /// Cast a libgit2 backend pointer back to its wrapper. Safe only because the pointer always
     /// originates from [`new`], which allocates a `RawOdbBackend` and hands libgit2 its address.
-    unsafe fn from_raw(backend: *mut raw::git_odb_backend) -> &'static mut RawOdbBackend {
-        unsafe { &mut *(backend as *mut RawOdbBackend) }
+    /// The caller must keep the backend alive for the borrow; libgit2 does so during callbacks.
+    /// Shared borrows permit concurrent callbacks; backend data uses its own synchronization.
+    unsafe fn from_raw<'a>(backend: *mut raw::git_odb_backend) -> &'a RawOdbBackend {
+        unsafe { &*(backend as *const RawOdbBackend) }
     }
 
     extern "C" fn backend_read(
@@ -372,7 +376,10 @@ mod tests {
 
     /// A minimal in-memory backend used to exercise the trampolines end-to-end through libgit2.
     struct MapBackend {
-        data: std::collections::HashMap<Oid, (Vec<u8>, ObjectType)>,
+        data: std::sync::Mutex<std::collections::HashMap<Oid, (Vec<u8>, ObjectType)>>,
+        readers: Option<
+            std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>>,
+        >,
     }
 
     impl OdbBackend for MapBackend {
@@ -381,20 +388,30 @@ mod tests {
         }
 
         fn read(&self, oid: Oid) -> Result<(Vec<u8>, ObjectType), git2::Error> {
-            self.data.get(&oid).cloned().ok_or_else(not_found)
+            if let Some(readers) = &self.readers {
+                readers.lock().unwrap().insert(std::thread::current().id());
+            }
+            self.data
+                .lock()
+                .unwrap()
+                .get(&oid)
+                .cloned()
+                .ok_or_else(not_found)
         }
 
-        fn write(&mut self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error> {
-            self.data.insert(oid, (data, kind));
+        fn write(&self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error> {
+            self.data.lock().unwrap().insert(oid, (data, kind));
             Ok(())
         }
 
         fn exists(&self, oid: Oid) -> bool {
-            self.data.contains_key(&oid)
+            self.data.lock().unwrap().contains_key(&oid)
         }
 
         fn exists_prefix(&self, oid: Oid, oid_len: usize) -> Option<Oid> {
             self.data
+                .lock()
+                .unwrap()
                 .keys()
                 .find(|key| key.as_bytes()[..oid_len] == oid.as_bytes()[..oid_len])
                 .copied()
@@ -418,7 +435,8 @@ mod tests {
         let repo = git2::Repository::init(dir.path()).unwrap();
 
         let backend = MapBackend {
-            data: std::collections::HashMap::new(),
+            data: Default::default(),
+            readers: None,
         };
         register(&repo, backend).unwrap();
 
@@ -434,5 +452,43 @@ mod tests {
         // An unknown oid must yield NotFound so lookups fall through rather than hard-failing.
         let unknown = Oid::from_str("0000000000000000000000000000000000000001").unwrap();
         assert!(!repo.odb().unwrap().exists(unknown));
+    }
+
+    #[test]
+    fn packing_workers_read_the_same_backend_concurrently() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let readers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        register(
+            &repo,
+            MapBackend {
+                data: Default::default(),
+                readers: Some(readers.clone()),
+            },
+        )
+        .unwrap();
+        let contents: Vec<_> = (0..2000)
+            .map(|index| format!("{}-{index}", "concurrent packed content".repeat(100)))
+            .collect();
+        let ids: Vec<_> = contents
+            .iter()
+            .map(|content| repo.blob(content.as_bytes()).unwrap())
+            .collect();
+        let mut builder = repo.packbuilder().unwrap();
+        let workers = builder.set_threads(4);
+        for oid in &ids {
+            builder.insert_object(*oid, Some("similar")).unwrap();
+        }
+        builder.write(&repo.path().join("objects/pack"), 0).unwrap();
+        if workers > 1 {
+            assert!(
+                readers.lock().unwrap().len() > 1,
+                "packing did not exercise worker callbacks"
+            );
+        }
+        let fresh = git2::Repository::open_bare(directory.path()).unwrap();
+        for (oid, content) in ids.iter().zip(&contents) {
+            assert_eq!(fresh.find_blob(*oid).unwrap().content(), content.as_bytes());
+        }
     }
 }
