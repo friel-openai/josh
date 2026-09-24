@@ -531,7 +531,17 @@ pub fn intersect(
         for entry in tree2.iter() {
             let name = entry.name().ok_or_else(|| anyhow!("no name"))?;
             if let Some(e1) = tree1.get_name(name) {
-                let child = intersect(transaction, e1.id(), entry.id())?;
+                // Entry kinds already tell us whether recursion can find two
+                // trees. Trying find_tree on a blob first reads its full data.
+                let child = if e1.kind() == Some(git2::ObjectType::Tree)
+                    && entry.kind() == Some(git2::ObjectType::Tree)
+                {
+                    intersect(transaction, e1.id(), entry.id())?
+                } else if entry.id() == empty_id() {
+                    empty_id()
+                } else {
+                    e1.id()
+                };
                 if child != empty_id() && child != git2::Oid::zero() {
                     builder.insert(name, child, e1.filemode()).ok();
                 }
@@ -948,6 +958,85 @@ pub fn empty(repo: &git2::Repository) -> git2::Tree<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersection_entry_kinds_preserve_content_modes_and_empty_subtrees() {
+        // Reference the previous OID-only traversal, including type changes and
+        // explicit empty subtrees; a right-hand empty tree must drop a blob.
+        fn reference(repo: &git2::Repository, left: git2::Oid, right: git2::Oid) -> git2::Oid {
+            if left == right {
+                return left;
+            }
+            if left == empty_id() || right == empty_id() {
+                return empty_id();
+            }
+            if let (Ok(left), Ok(right)) = (repo.find_tree(left), repo.find_tree(right)) {
+                let mut result = repo.treebuilder(None).unwrap();
+                for entry in right.iter() {
+                    let name = entry.name().unwrap();
+                    if let Some(original) = left.get_name(name) {
+                        let child = reference(repo, original.id(), entry.id());
+                        if child != empty_id() && child != git2::Oid::zero() {
+                            result.insert(name, child, original.filemode()).unwrap();
+                        }
+                    }
+                }
+                result.write().unwrap()
+            } else {
+                left
+            }
+        }
+        let directory = tempfile::TempDir::new().unwrap();
+        git2::Repository::init_bare(directory.path()).unwrap();
+        let transaction = open_transaction(&directory);
+        let repo = transaction.repo();
+        let first = repo.blob(b"first contents").unwrap();
+        let second = repo.blob(b"changed contents").unwrap();
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        let mut nested = repo.treebuilder(None).unwrap();
+        nested.insert("shared", first, 0o100755).unwrap();
+        let first_tree = nested.write().unwrap();
+        nested.insert("shared", second, 0o100644).unwrap();
+        nested.insert("new", first, 0o100644).unwrap();
+        let second_tree = nested.write().unwrap();
+        let signature = git2::Signature::now("Example", "example@example.com").unwrap();
+        let commit = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "Submodule",
+                &repo.find_tree(empty).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let entries = [
+            (first, 0o100644),
+            (second, 0o100644),
+            (first, 0o100755),
+            (second, 0o120000),
+            (first_tree, 0o040000),
+            (second_tree, 0o040000),
+            (empty, 0o040000),
+            (commit, 0o160000),
+        ];
+        let mut trees = vec![empty];
+        for (oid, mode) in entries {
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert("same-name", oid, mode).unwrap();
+            tree.insert("unchanged", first, 0o100644).unwrap();
+            trees.push(tree.write().unwrap());
+        }
+        for left in &trees {
+            for right in &trees {
+                assert_eq!(
+                    intersect(&transaction, *left, *right).unwrap(),
+                    reference(repo, *left, *right),
+                    "{left} intersect {right}"
+                );
+            }
+        }
+    }
 
     fn make_tree(repo: &git2::Repository, paths: &[&str]) -> git2::Oid {
         let mut b = git2::build::TreeUpdateBuilder::new();
