@@ -376,19 +376,45 @@ where
     I: IntoIterator<Item = P>,
     P: Into<std::path::PathBuf>,
 {
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+    grouped_files(&paths).unwrap_or_else(|| {
+        compose(
+            &paths
+                .into_iter()
+                .map(|path| Filter::new().file(path))
+                .collect::<Vec<_>>(),
+        )
+    })
+}
+
+/// Select exact paths from a borrowed slice, with the same identities and ordering
+/// as [`files`]. Callers can retain their path buffers without cloning them for
+/// canonical construction. General composition still owns its fallback paths.
+pub fn files_from_paths<P: AsRef<std::path::Path>>(paths: &[P]) -> Filter {
+    grouped_files(paths).unwrap_or_else(|| {
+        compose(
+            &paths
+                .iter()
+                .map(|path| Filter::new().file(path.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+    })
+}
+
+fn grouped_files<P: AsRef<std::path::Path>>(paths: &[P]) -> Option<Filter> {
     use std::collections::BTreeMap;
     #[cfg(not(unix))]
     use std::path::Component;
-    use std::path::PathBuf;
 
     #[derive(Default)]
     struct Paths<'a> {
         terminal: bool,
         children: BTreeMap<&'a str, Paths<'a>>,
     }
-    fn collect(paths: &[PathBuf]) -> Option<Paths<'_>> {
+    fn collect<P: AsRef<std::path::Path>>(paths: &[P]) -> Option<Paths<'_>> {
         let mut root = Paths::default();
         for path in paths {
+            let path = path.as_ref();
             let text = path.to_str()?;
             if text.is_empty() || text.contains('\0') {
                 return None;
@@ -449,17 +475,7 @@ where
             _ => opt::remember_optimized(to_filter(Op::Compose(branches))),
         }
     }
-    let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
-    if let Some(grouped) = collect(&paths) {
-        build(&grouped)
-    } else {
-        compose(
-            &paths
-                .into_iter()
-                .map(|path| Filter::new().file(path))
-                .collect::<Vec<_>>(),
-        )
-    }
+    collect(paths).map(|paths| build(&paths))
 }
 
 pub fn invert(filter: Filter) -> anyhow::Result<Filter> {
@@ -522,6 +538,9 @@ mod file_builder_tests {
                     .map(|path| Filter::new().file(*path))
                     .collect::<Vec<_>>(),
             );
+            let borrowed = files_from_paths(&paths);
+            assert_eq!(borrowed, expected, "borrowed subset {seed}");
+            assert_eq!(borrowed.id(), expected.id());
             let actual = files(paths);
             assert_eq!(actual, expected, "subset {seed}");
             assert_eq!(actual.id(), expected.id());
@@ -541,6 +560,7 @@ mod file_builder_tests {
             vec!["a\0b"],
             vec![r"back\slash", "drive:c", "a/space name"],
         ] {
+            assert_eq!(files_from_paths(&paths), files(paths.clone()));
             assert_eq!(
                 files(paths.clone()),
                 compose(
@@ -588,6 +608,7 @@ mod file_builder_tests {
                     .map(|path| Filter::new().file(path))
                     .collect::<Vec<_>>(),
             );
+            assert_eq!(files_from_paths(&paths), expected, "borrowed shape {case}");
             let actual = files(paths);
             assert_eq!(actual, expected, "shape {case}");
             assert_eq!(actual.id(), expected.id());
@@ -628,11 +649,30 @@ mod file_builder_tests {
                         .map(|path| Filter::new().file(*path))
                         .collect::<Vec<_>>(),
                 );
+                assert_eq!(
+                    files_from_paths(&paths),
+                    expected,
+                    "borrowed subset {subset}, order {order}"
+                );
                 let actual = files(paths);
                 assert_eq!(actual, expected, "subset {subset}, order {order}");
                 assert_eq!(actual.id(), expected.id());
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn borrowed_files_preserve_non_utf8_native_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let paths = vec![std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"a/\xff".to_vec(),
+        ))];
+        let expected = compose(&[Filter::new().file(&paths[0])]);
+        let actual = files_from_paths(&paths);
+        drop(paths);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.id(), expected.id());
     }
 
     #[test]
