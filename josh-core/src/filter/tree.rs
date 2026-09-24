@@ -1081,9 +1081,13 @@ pub(super) fn select_identity_files<'a>(
         let output = match builder {
             Some(mut builder) => {
                 let output = builder.write()?;
-                if selection == IdentitySelection::Keep {
+                const MAX_REUSABLE_BUILDER_ENTRIES: usize = 64;
+                if selection == IdentitySelection::Keep
+                    && builder.len() <= MAX_REUSABLE_BUILDER_ENTRIES
+                {
                     // Keep builders start empty. Reuse their map and serialization
-                    // buffers for siblings, only within this selection call.
+                    // buffers for siblings, only within this selection call. Drop
+                    // broad builders rather than clearing oversized maps repeatedly.
                     builder.clear()?;
                     builders.push(builder);
                 }
@@ -1397,6 +1401,11 @@ mod tests {
         let repo = git2::Repository::init_bare(directory.path()).unwrap();
         let mut source_paths = Vec::new();
         let mut selected_paths = Vec::new();
+        for index in 0..96 {
+            let selected = format!("a-wide/keep-{index:02}");
+            source_paths.push(selected.clone());
+            selected_paths.push(selected);
+        }
         for index in 0..24 {
             let selected = format!("directory-{index:02}/nested/keep-{index:02}");
             source_paths.push(selected.clone());
