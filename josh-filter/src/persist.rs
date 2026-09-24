@@ -1,4 +1,5 @@
 use anyhow::{Context, anyhow};
+use gix_object::WriteTo;
 use gix_object::bstr::BString;
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};
@@ -96,7 +97,7 @@ fn push_tree_entries(
 }
 
 struct InMemoryBuilder<'a> {
-    staging: josh_gix_ext::StagingOdb<'a>,
+    staging: Option<josh_gix_ext::StagingOdb<'a>>,
     /// Present when building for persistence (`as_tree`): used to resolve the object kind of
     /// `InsertContent::Oid` so the object can be referenced as a tree entry with the correct
     /// mode. Absent when computing `Filter::id`, which must stay repository-independent.
@@ -109,7 +110,8 @@ struct InMemoryBuilder<'a> {
 impl<'a> InMemoryBuilder<'a> {
     fn new(repo: Option<&'a git2::Repository>) -> Self {
         Self {
-            staging: josh_gix_ext::StagingOdb::new(),
+            // Identity hashing never reads or flushes these temporary objects.
+            staging: repo.map(|_| josh_gix_ext::StagingOdb::new()),
             repo,
             persist_ids: HashMap::new(),
         }
@@ -125,7 +127,14 @@ impl<'a> InMemoryBuilder<'a> {
     }
 
     fn write_blob(&mut self, data: &[u8]) -> gix_hash::ObjectId {
-        self.staging.write_blob(data)
+        if let Some(staging) = &mut self.staging {
+            return staging.write_blob(data);
+        }
+        if data.is_empty() {
+            return gix_hash::ObjectId::empty_blob(gix_hash::Kind::Sha1);
+        }
+        gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Blob, data)
+            .expect("failed to compute hash")
     }
 
     /// Persisted filter trees sort by plain filename bytes -- NOT canonical git tree order (which
@@ -134,7 +143,13 @@ impl<'a> InMemoryBuilder<'a> {
     /// as is for filter ids to remain stable.
     fn write_tree(&mut self, mut tree: gix_object::Tree) -> gix_hash::ObjectId {
         tree.entries.sort_by(|a, b| a.filename.cmp(&b.filename));
-        self.staging.write_tree(&tree)
+        if let Some(staging) = &mut self.staging {
+            return staging.write_tree(&tree);
+        }
+        let mut buffer = Vec::with_capacity(tree.size() as usize);
+        tree.write_to(&mut buffer).expect("failed to write tree");
+        gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Tree, &buffer)
+            .expect("failed to compute hash")
     }
 
     fn build_str_params(&mut self, params: &[&str]) -> gix_hash::ObjectId {
@@ -655,7 +670,11 @@ pub fn as_tree(repo: &git2::Repository, filter: Filter) -> anyhow::Result<git2::
     let root_oid = builder.build_persist(&odb, filter)?;
     let root_oid = git2::Oid::from_bytes(root_oid.as_bytes())?;
 
-    builder.staging.flush(&odb)?;
+    builder
+        .staging
+        .as_mut()
+        .expect("persistence builder stages objects")
+        .flush(&odb)?;
 
     // Now the tree should really be in the ODB
     Ok(root_oid)
@@ -1180,6 +1199,40 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> anyhow::Result<Op
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn hash_only_identity_matches_staged_serialization() {
+        let files: Vec<_> = (0..12)
+            .map(|index| {
+                let path = std::path::PathBuf::from(format!("日本語/{index}/file"));
+                to_filter(Op::File(path.clone(), path))
+            })
+            .collect();
+        let composed = to_filter(Op::Compose(files.clone()));
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("a".to_owned(), String::new());
+        metadata.insert("a.b".to_owned(), "é".to_owned());
+        for op in [
+            Op::Nop,
+            Op::Empty,
+            Op::File("a".into(), "b".into()),
+            Op::Subdir("日本語/path".into()),
+            Op::Compose(files),
+            Op::Chain(vec![composed, to_filter(Op::Prefix("out".into()))]),
+            Op::Meta(metadata, composed),
+        ] {
+            let mut hashing = InMemoryBuilder::new(None);
+            let mut staged = InMemoryBuilder {
+                staging: Some(josh_gix_ext::StagingOdb::new()),
+                ..InMemoryBuilder::new(None)
+            };
+            assert_eq!(
+                hashing.build_op(&op).unwrap(),
+                staged.build_op(&op).unwrap()
+            );
+            assert!(hashing.staging.is_none());
+        }
+    }
 
     #[test]
     fn interning_preserves_identity_across_threads_and_oid_initialization() {
