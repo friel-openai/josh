@@ -434,14 +434,14 @@ where
                         _ => chain.push(inner),
                     }
                     chain.push(to_filter(Op::Prefix((*name).into())));
-                    to_filter(Op::Chain(chain))
+                    opt::remember_optimized(to_filter(Op::Chain(chain)))
                 }
             })
             .collect();
         match branches.as_slice() {
             [] => to_filter(Op::Empty),
             [only] => *only,
-            _ => to_filter(Op::Compose(branches)),
+            _ => opt::remember_optimized(to_filter(Op::Compose(branches))),
         }
     }
     let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
@@ -585,6 +585,52 @@ mod file_builder_tests {
             let actual = files(paths);
             assert_eq!(actual, expected, "shape {case}");
             assert_eq!(actual.id(), expected.id());
+        }
+    }
+
+    #[test]
+    fn pin_normalization_preserves_existing_persisted_identities() {
+        // Captured from the previous optimizer. These IDs key persisted history
+        // caches, including pins around selection, metadata and nested pins.
+        let cases = [
+            (
+                Filter::new().pin(Filter::new().empty()),
+                "7afbd5d684431fea64c0e91577094aef966b7300",
+            ),
+            (
+                Filter::new().pin(files(["a", "a-b/c"])),
+                "6071cc2422c6a4f390f0eedbc017405692affce7",
+            ),
+            (
+                Filter::new().pin(Filter::new().file("a").select(Filter::new().file("a-b/c"))),
+                "c2826e7502025400380d2b7fe618b3f245e49948",
+            ),
+            (
+                Filter::new().pin(
+                    Filter::new()
+                        .subdir("a")
+                        .prefix("a/b")
+                        .with_meta("test", "x"),
+                ),
+                "8109eebd83c06eb4caac1abd3b9653b33a123f54",
+            ),
+            (
+                Filter::new().pin(files(["a/b", "x y/z"]).with_meta("test", "x")),
+                "2945721b9de602de80a118d007ae38cf6aeee313",
+            ),
+            (
+                Filter::new().pin(
+                    Filter::new().pin(
+                        Filter::new()
+                            .file("a/b")
+                            .exclude(Filter::new().subdir("日本語/é")),
+                    ),
+                ),
+                "401d47ef97a4e3f1ea4dcaafb2515267edd40d34",
+            ),
+        ];
+        for (filter, expected) in cases {
+            assert_eq!(filter.id().to_string(), expected);
         }
     }
 }

@@ -43,6 +43,12 @@ static FLATTENED: LazyLock<std::sync::Mutex<FilterHashMap>> =
 static FLATTENED_FULL: LazyLock<std::sync::Mutex<FilterHashMap>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
 
+// Used only when a typed builder has already constructed the optimizer's normal form.
+pub(crate) fn remember_optimized(filter: Filter) -> Filter {
+    OPTIMIZED.lock().unwrap().insert(filter, filter);
+    filter
+}
+
 /*
  * Attempt to create an alternative representation of a filter AST that is most
  * suitable for fast evaluation and cache reuse.
