@@ -158,7 +158,7 @@ impl MemOdb {
                 Err(error) if error.code() == git2::ErrorCode::NotFound => {}
                 Err(error) => return Err(error),
             }
-            // A stable tree-entry name groups similarly shaped trees for delta search.
+            // The last tree-entry name groups similarly shaped trees for delta search.
             // This is only a packing hint: it never changes object bytes or ids. Copy
             // the short hints before insertion, which reads through the same mutex.
             let names: Vec<_> = {
@@ -170,8 +170,16 @@ impl MemOdb {
                         if *kind != raw::GIT_OBJECT_TREE {
                             return None;
                         }
-                        let end = data.iter().position(|byte| *byte == 0)?;
-                        std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+                        let mut remaining: &[u8] = data;
+                        let mut last_header = None;
+                        while !remaining.is_empty() {
+                            let end = remaining.iter().position(|byte| *byte == 0)?;
+                            last_header = Some(&remaining[..end]);
+                            // Each raw tree header is followed by its 20-byte object id.
+                            // Truncated data simply receives no advisory name.
+                            remaining = remaining.get(end + 21..)?;
+                        }
+                        std::str::from_utf8(last_header?).ok().map(str::to_owned)
                     })
                     .collect()
             };
@@ -313,6 +321,13 @@ mod tests {
         }
         let empty = repo.treebuilder(None).unwrap().write().unwrap();
         trees.push((empty, Vec::new()));
+        for bytes in [
+            b"100644 truncated\0short".as_slice(),
+            b"100644 missing terminator".as_slice(),
+        ] {
+            let oid = repo.odb().unwrap().write(ObjectType::Tree, bytes).unwrap();
+            trees.push((oid, bytes.to_vec()));
+        }
         store.flush().unwrap();
         let fresh = git2::Repository::open_bare(directory.path()).unwrap();
         let odb = fresh.odb().unwrap();
