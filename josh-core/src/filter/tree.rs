@@ -1015,8 +1015,13 @@ pub(super) fn select_identity_files<'a>(
         {
             return Ok(Some(output));
         }
-        let mut builder =
-            repo.treebuilder((selection == IdentitySelection::Remove).then_some(input))?;
+        // Removal often finds no selected names in a subtree. Avoid cloning its
+        // entries into a builder until the first actual edit.
+        let mut builder = if selection == IdentitySelection::Keep {
+            Some(repo.treebuilder(None)?)
+        } else {
+            None
+        };
         let mut changed = false;
         for (name, selected) in &mut paths.children {
             let Some(entry) = input.get_name(name) else {
@@ -1030,11 +1035,17 @@ pub(super) fn select_identity_files<'a>(
                 }
                 match selection {
                     IdentitySelection::Keep => {
-                        builder.insert(name, entry.id(), entry.filemode())?;
+                        builder
+                            .as_mut()
+                            .unwrap()
+                            .insert(name, entry.id(), entry.filemode())?;
                     }
                     IdentitySelection::Remove => {
                         changed = true;
-                        builder.remove(name)?;
+                        if builder.is_none() {
+                            builder = Some(repo.treebuilder(Some(input))?);
+                        }
+                        builder.as_mut().unwrap().remove(name)?;
                     }
                 }
             } else if entry.kind() == Some(git2::ObjectType::Tree) {
@@ -1046,6 +1057,10 @@ pub(super) fn select_identity_files<'a>(
                     continue;
                 }
                 changed = true;
+                if builder.is_none() {
+                    builder = Some(repo.treebuilder(Some(input))?);
+                }
+                let builder = builder.as_mut().unwrap();
                 if output != empty_id() {
                     builder.insert(name, output, 0o040000)?;
                 } else if selection == IdentitySelection::Remove {
@@ -1056,7 +1071,7 @@ pub(super) fn select_identity_files<'a>(
         let output = if selection == IdentitySelection::Remove && !changed {
             input.id()
         } else {
-            builder.write()?
+            builder.unwrap().write()?
         };
         transaction.insert_apply(key, input.id(), output);
         Ok(Some(output))
