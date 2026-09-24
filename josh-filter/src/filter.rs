@@ -377,7 +377,9 @@ where
     P: Into<std::path::PathBuf>,
 {
     use std::collections::BTreeMap;
-    use std::path::{Component, PathBuf};
+    #[cfg(not(unix))]
+    use std::path::Component;
+    use std::path::PathBuf;
 
     #[derive(Default)]
     struct Paths<'a> {
@@ -391,8 +393,9 @@ where
             if text.is_empty() || text.contains('\0') {
                 return None;
             }
-            // Require the textual POSIX spelling to match native normal components.
-            // This also keeps Windows prefixes/separators on the general path.
+            // Non-Unix native paths may have additional separators and prefixes.
+            // On Unix, validate components while building the shared path tree.
+            #[cfg(not(unix))]
             if !path
                 .components()
                 .map(|component| match component {
@@ -405,6 +408,9 @@ where
             }
             let mut node = &mut root;
             for component in text.split('/') {
+                if component.is_empty() || component == "." || component == ".." {
+                    return None;
+                }
                 node = node.children.entry(component).or_default();
             }
             // Keep ancestor-before-descendant overlay order. Reversed overlaps
@@ -533,6 +539,7 @@ mod file_builder_tests {
             vec!["a/../one"],
             vec!["a/one/"],
             vec!["a\0b"],
+            vec![r"back\slash", "drive:c", "a/space name"],
         ] {
             assert_eq!(
                 files(paths.clone()),
