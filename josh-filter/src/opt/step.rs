@@ -1,6 +1,6 @@
 use super::prefix_sort::prefix_sort;
 use super::structure::{common_post, common_pre, group, last_chain, resurrects_from_empty};
-use super::{FilterSet, OPTIMIZED};
+use super::{FilterSet, OPTIMIZED, STEPPED};
 use crate::filter::Filter;
 use crate::op::Op;
 use crate::persist::{to_filter, to_op, to_op_ref};
@@ -24,6 +24,9 @@ fn prefix_of(op: Op) -> Filter {
  */
 pub(super) fn step(filter: Filter) -> Filter {
     if let Some(f) = OPTIMIZED.lock().unwrap().get(&filter) {
+        return *f;
+    }
+    if let Some(f) = STEPPED.lock().unwrap().get(&filter) {
         return *f;
     }
     let original = filter;
@@ -268,6 +271,6 @@ pub(super) fn step(filter: Filter) -> Filter {
         _ => to_op(filter),
     });
 
-    OPTIMIZED.lock().unwrap().insert(original, result);
+    STEPPED.lock().unwrap().insert(original, result);
     result
 }

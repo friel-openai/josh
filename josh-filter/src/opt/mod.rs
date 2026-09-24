@@ -28,6 +28,10 @@ type FilterHashMap = HashMap<Filter, Filter, BuildHasherDefault<PassthroughHashe
 type FilterSet = HashSet<Filter, BuildHasherDefault<PassthroughHasher>>;
 type InvertHashMap = HashMap<Filter, Option<Filter>, BuildHasherDefault<PassthroughHasher>>;
 
+// A single rewrite step is not a fully optimized result.
+static STEPPED: LazyLock<std::sync::Mutex<FilterHashMap>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
+
 static OPTIMIZED: LazyLock<std::sync::Mutex<FilterHashMap>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
 static MINIMIZED: LazyLock<std::sync::Mutex<FilterHashMap>> =
@@ -42,6 +46,12 @@ static FLATTENED: LazyLock<std::sync::Mutex<FilterHashMap>> =
 // the same filter, so they must not share a memo.
 static FLATTENED_FULL: LazyLock<std::sync::Mutex<FilterHashMap>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
+
+// Used only when a typed builder has already constructed the optimizer's normal form.
+pub(crate) fn remember_optimized(filter: Filter) -> Filter {
+    OPTIMIZED.lock().unwrap().insert(filter, filter);
+    filter
+}
 
 /*
  * Attempt to create an alternative representation of a filter AST that is most
@@ -99,4 +109,26 @@ fn iterate(filter: Filter) -> Filter {
         filter = optimized;
     }
     filter
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::{filter, op::Op, persist::to_filter};
+
+    #[test]
+    fn a_cached_rewrite_step_is_not_a_complete_optimization() {
+        let first = Filter::new().file("cache-test/one");
+        let second = Filter::new().file("cache-test/two");
+        filter::compose(&[first, second, Filter::new().file("other/x")]);
+        let expected = to_filter(Op::Chain(vec![
+            to_filter(Op::Subdir("cache-test".into())),
+            to_filter(Op::Compose(vec![
+                to_filter(Op::File("one".into(), "one".into())),
+                to_filter(Op::File("two".into(), "two".into())),
+            ])),
+            to_filter(Op::Prefix("cache-test".into())),
+        ]));
+        assert_eq!(filter::compose(&[first, second]), expected);
+    }
 }
