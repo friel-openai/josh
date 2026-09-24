@@ -179,7 +179,8 @@ impl MemOdb {
                     Err(error) => return Err(error),
                 }
             }
-            // A stable tree-entry name groups similarly shaped trees for delta search.
+            // The last tree-entry name groups similarly shaped trees for delta search.
+            // Walk record boundaries without interpreting modes or rewriting any bytes.
             // This is only a packing hint: it never changes object bytes or ids. Copy
             // the short hints before insertion, which reads through the same mutex.
             let names: Vec<_> = {
@@ -191,8 +192,14 @@ impl MemOdb {
                         if *kind != raw::GIT_OBJECT_TREE {
                             return None;
                         }
-                        let end = data.iter().position(|byte| *byte == 0)?;
-                        std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+                        let mut remaining = data.as_ref();
+                        let mut name = None;
+                        while !remaining.is_empty() {
+                            let end = remaining.iter().position(|byte| *byte == 0)?;
+                            name = std::str::from_utf8(&remaining[..end]).ok();
+                            remaining = remaining.get(end + 1 + Oid::zero().as_bytes().len()..)?;
+                        }
+                        name.map(str::to_owned)
                     })
                     .collect()
             };
