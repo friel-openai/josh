@@ -102,11 +102,13 @@ fn flatten_impl(filter: Filter, full: bool) -> Filter {
             Op::Chain(flattened.iter().map(|f| flatten_impl(*f, full)).collect())
         }
         Op::Subtract(a, b) => Op::Subtract(flatten_impl(*a, full), flatten_impl(*b, full)),
-        Op::Exclude(b) => Op::Exclude(flatten_impl(*b, full)),
-        Op::Select(b) => Op::Select(flatten_impl(*b, full)),
-        // Pin's operand is independent of its surrounding chain. Normalizing it
-        // directly reuses canonical typed builders instead of expanding their
+        // Wrapper operands are independent of the surrounding chain. Normalize them
+        // directly to reuse canonical typed builders instead of expanding their
         // factored paths only to group them again. Full display flattening stays full.
+        Op::Exclude(b) if !full => Op::Exclude(super::optimize(*b)),
+        Op::Exclude(b) => Op::Exclude(flatten_impl(*b, full)),
+        Op::Select(b) if !full => Op::Select(super::optimize(*b)),
+        Op::Select(b) => Op::Select(flatten_impl(*b, full)),
         Op::Pin(b) if !full => Op::Pin(super::optimize(*b)),
         Op::Pin(b) => Op::Pin(flatten_impl(*b, full)),
         Op::Starlark(path, sub) => Op::Starlark(path.clone(), flatten_impl(*sub, full)),

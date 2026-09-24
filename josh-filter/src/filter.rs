@@ -633,4 +633,17 @@ mod file_builder_tests {
             assert_eq!(filter.id().to_string(), expected);
         }
     }
+
+    #[test]
+    fn selector_normalization_preserves_existing_persisted_identities() {
+        let files = files(["a", "a-b/c", "x y/z", "日本語/é"]);
+        assert_eq!(
+            Filter::new().exclude(files).id().to_string(),
+            "61c3becbf592cd24b431102e0c42226500b3cde7"
+        );
+        assert_eq!(
+            Filter::new().select(files).id().to_string(),
+            "0f9d57f7877a72ecfbfc492c9b9902219e5341c0"
+        );
+    }
 }
