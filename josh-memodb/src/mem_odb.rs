@@ -10,7 +10,7 @@
 //! backend) and the flusher thread (which reads objects to pack them, then evicts them); it is
 //! `Send + Sync` so its `Arc` can cross to the flusher.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,7 @@ use libgit2_sys as raw;
 
 use crate::odb_backend::{self, OdbBackend};
 
-type ObjectMap = BTreeMap<Oid, (raw::git_object_t, Box<[u8]>)>;
+type ObjectMap = HashMap<Oid, (raw::git_object_t, Box<[u8]>)>;
 
 /// The buffered objects plus a running total of their data size, guarded by one lock so that an
 /// insert and the overflow check following it are observed atomically.
@@ -125,17 +125,19 @@ impl MemOdb {
         // Snapshot the oids under the lock, then release it. The objects must stay in the store
         // across the packbuilder below: `pb.write` reads each one back through the odb -> this
         // backend -> `self.inner.lock()`, so we can neither hold the lock here (self-deadlock) nor
-        // drain the map before the pack is on disk. A BTreeMap iterates in sorted oid order, so the
+        // drain the map before the pack is on disk. Sort the snapshot once in oid order so the
         // default single-threaded packbuilder produces a deterministic packfile. An explicit
         // parallel pack.threads setting can change delta choices and physical pack names,
         // but never object ids or the durability boundary.
-        let oids: Vec<Oid> = {
+        let mut oids: Vec<Oid> = {
             let inner = self.inner.lock().unwrap();
             if inner.map.is_empty() {
                 return Ok(());
             }
             inner.map.keys().copied().collect()
         };
+
+        oids.sort_unstable();
 
         let repo = git2::Repository::open(&self.repo_path)?;
         self.register(&repo);
@@ -275,6 +277,40 @@ mod tests {
 
         // The store is drained: a second flush is a no-op.
         store.flush().unwrap();
+    }
+
+    #[test]
+    fn single_threaded_pack_is_independent_of_insertion_order() {
+        let contents: Vec<_> = (0..200)
+            .map(|index| format!("{}-{index}", "shared packed content".repeat(100)))
+            .collect();
+        let mut packs = Vec::new();
+        for reverse in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = git2::Repository::init_bare(directory.path()).unwrap();
+            repo.config().unwrap().set_i32("pack.threads", 1).unwrap();
+            let store = MemOdb::new(None, repo.path().to_owned());
+            store.register(&repo);
+            for index in 0..contents.len() {
+                let index = if reverse {
+                    contents.len() - 1 - index
+                } else {
+                    index
+                };
+                repo.blob(contents[index].as_bytes()).unwrap();
+            }
+            store.flush().unwrap();
+            let pack = std::fs::read_dir(crate::pack::packfile_path(&repo))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "pack")
+                })
+                .unwrap();
+            packs.push(std::fs::read(pack).unwrap());
+        }
+        assert_eq!(packs[0], packs[1]);
     }
 
     #[test]
