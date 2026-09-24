@@ -1591,6 +1591,9 @@ pub fn apply<'a>(
         }
 
         Op::Compose(filters) => {
+            if let Some(selected) = tree::select_identity_files(repo, x.tree(), filters)? {
+                return Ok(x.with_tree(selected));
+            }
             let filtered: Vec<_> = filters
                 .iter()
                 .map(|f| apply(transaction, *f, x.clone()))
