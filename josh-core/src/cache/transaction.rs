@@ -104,7 +104,9 @@ impl TransactionContext {
 #[allow(unused)]
 struct Transaction2 {
     commit_map: HashMap<git2::Oid, HashMap<git2::Oid, git2::Oid>>,
-    apply_map: HashMap<git2::Oid, HashMap<git2::Oid, git2::Oid>>,
+    // Tree results live only in this transaction. Interned filters are stable keys;
+    // do not compute their persistent object ids just for an in-memory lookup.
+    apply_map: HashMap<crate::filter::Filter, HashMap<git2::Oid, git2::Oid>>,
     identity_paths:
         std::collections::VecDeque<(crate::filter::Filter, crate::filter::tree::IdentityPaths)>,
     subtract_map: HashMap<(git2::Oid, git2::Oid), git2::Oid>,
@@ -289,15 +291,12 @@ impl Transaction {
 
     pub fn insert_apply(&self, filter: crate::filter::Filter, from: git2::Oid, to: git2::Oid) {
         let mut t2 = self.t2.borrow_mut();
-        t2.apply_map
-            .entry(filter.id())
-            .or_default()
-            .insert(from, to);
+        t2.apply_map.entry(filter).or_default().insert(from, to);
     }
 
     pub fn get_apply(&self, filter: crate::filter::Filter, from: git2::Oid) -> Option<git2::Oid> {
         let t2 = self.t2.borrow_mut();
-        if let Some(m) = t2.apply_map.get(&filter.id()) {
+        if let Some(m) = t2.apply_map.get(&filter) {
             return m.get(&from).cloned();
         }
         None
