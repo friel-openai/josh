@@ -430,7 +430,7 @@ where
         let mut branches = Vec::new();
         for (name, child) in &paths.children {
             if child.terminal {
-                branches.push(to_filter(Op::File((*name).into(), (*name).into())));
+                branches.push(persist::identity_file(name));
             }
             if !child.children.is_empty() {
                 let inner = build(child);

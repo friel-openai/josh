@@ -17,9 +17,17 @@ pub(crate) struct Node {
 
 /// Canonicalizes each `Op` to a single interned node by structural equality, so equal `Op`s
 /// map to the same node (and therefore the same `Filter` pointer). `Op` derives `Hash`/`Eq`
-/// and its child `Filter`s hash/compare by pointer, so the `Op` itself is the key.
-static INTERN: LazyLock<std::sync::Mutex<HashMap<&'static Op, &'static Node>>> =
-    LazyLock::new(Default::default);
+/// and its child `Filter`s hash/compare by pointer. Single-component UTF8 identity
+/// files use their normalized name as a key; other nodes use the complete `Op`.
+#[derive(Default)]
+struct Intern {
+    other: HashMap<&'static Op, &'static Node>,
+    // Single-component identity files have one native normal component. Index its
+    // UTF8 name directly, preserving the same equality as the complete Op.
+    identity_files: HashMap<&'static str, &'static Node>,
+}
+
+static INTERN: LazyLock<std::sync::Mutex<Intern>> = LazyLock::new(Default::default);
 
 pub fn peel_op(filter: Filter) -> Op {
     peel_op_ref(filter).clone()
@@ -574,17 +582,63 @@ impl<'a> InMemoryBuilder<'a> {
 // return the existing node and drop `op`; on a miss we leak a node (its `Op` lives for the
 // process) and borrow its immutable `Op` as the key. This avoids duplicating
 // every path/vector and keeps the hash-table entries small.
-fn intern(op: Op) -> &'static Node {
-    let mut intern = INTERN.lock().unwrap();
-    if let Some(node) = intern.get(&op) {
+fn identity_file_name(path: &std::path::Path) -> Option<&str> {
+    let mut components = path.components();
+    let std::path::Component::Normal(name) = components.next()? else {
+        return None;
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    name.to_str()
+}
+
+fn intern_locked(intern: &mut Intern, op: Op) -> &'static Node {
+    let identity_path = match &op {
+        Op::File(destination, source) if destination == source => identity_file_name(destination),
+        _ => None,
+    };
+    if let Some(node) = match identity_path {
+        Some(path) => intern.identity_files.get(path),
+        None => intern.other.get(&op),
+    } {
         return node;
     }
+    let identity = identity_path.is_some();
     let node: &'static Node = Box::leak(Box::new(Node {
         op,
         oid: OnceLock::new(),
     }));
-    intern.insert(&node.op, node);
+    if identity {
+        let Op::File(path, _) = &node.op else {
+            unreachable!("identity file variant checked before allocation")
+        };
+        intern.identity_files.insert(
+            identity_file_name(path).expect("single normal UTF8 component checked"),
+            node,
+        );
+    } else {
+        intern.other.insert(&node.op, node);
+    }
     node
+}
+
+fn intern(op: Op) -> &'static Node {
+    intern_locked(&mut INTERN.lock().unwrap(), op)
+}
+
+/// Intern a validated canonical component without allocating path buffers on hits.
+/// Called only after the grouped builder has checked native path components.
+pub(crate) fn identity_file(name: &str) -> Filter {
+    debug_assert_eq!(identity_file_name(std::path::Path::new(name)), Some(name));
+    let mut intern = INTERN.lock().unwrap();
+    if let Some(node) = intern.identity_files.get(name) {
+        return Filter(node);
+    }
+    Filter(intern_locked(
+        &mut intern,
+        Op::File(name.into(), name.into()),
+    ))
 }
 
 pub fn to_filter(op: Op) -> Filter {
@@ -1180,6 +1234,82 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> anyhow::Result<Op
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn borrowed_identity_files_share_general_interning_and_path_equality() {
+        use std::path::Path;
+        for (index, first_borrowed) in [false, true].into_iter().enumerate() {
+            let path = std::path::PathBuf::from(format!("borrowed-intern-{index}-file"));
+            let general = || to_filter(Op::File(path.clone(), path.clone()));
+            let original = if first_borrowed {
+                identity_file(path.to_str().unwrap())
+            } else {
+                general()
+            };
+            assert_eq!(original, general());
+            assert_eq!(original, identity_file(path.to_str().unwrap()));
+            let normalized_alias = path.join("");
+            assert_eq!(normalized_alias, path);
+            assert_eq!(
+                original,
+                to_filter(Op::File(normalized_alias.clone(), normalized_alias.clone()))
+            );
+            assert_eq!(
+                original,
+                to_filter(Op::File(normalized_alias, path.clone()))
+            );
+            assert_ne!(
+                original,
+                to_filter(Op::File(path.clone(), "elsewhere".into()))
+            );
+            let expected = original.id();
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..128 {
+                            let borrowed = identity_file(path.to_str().unwrap());
+                            assert_eq!(borrowed, to_filter(Op::File(path.clone(), path.clone())));
+                            assert_eq!(borrowed.id(), expected);
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
+        assert_eq!(identity_file_name(Path::new("")), None);
+        assert_eq!(identity_file_name(Path::new("nested/file")), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'x', 0xff]));
+            assert_eq!(identity_file_name(&path), None);
+            let original = to_filter(Op::File(path.clone(), path.clone()));
+            assert_eq!(original, to_filter(Op::File(path.clone(), path)));
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let path = Path::new("borrowed-intern-concurrent-first-insertion");
+                    if index % 2 == 0 {
+                        identity_file(path.to_str().unwrap())
+                    } else {
+                        to_filter(Op::File(path.to_owned(), path.to_owned()))
+                    }
+                })
+            })
+            .collect();
+        let filters: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(filters.iter().all(|filter| *filter == filters[0]));
+    }
 
     #[test]
     fn interning_preserves_identity_across_threads_and_oid_initialization() {
