@@ -17,9 +17,15 @@ pub(crate) struct Node {
 
 /// Canonicalizes each `Op` to a single interned node by structural equality, so equal `Op`s
 /// map to the same node (and therefore the same `Filter` pointer). `Op` derives `Hash`/`Eq`
-/// and its child `Filter`s hash/compare by pointer, so the `Op` itself is the key.
-static INTERN: LazyLock<std::sync::Mutex<HashMap<&'static Op, &'static Node, ahash::RandomState>>> =
-    LazyLock::new(Default::default);
+/// and its child `Filter`s hash/compare by pointer. The table stores only node pointers;
+/// hash/equality use their immutable Op rather than node identity.
+#[derive(Default)]
+struct Interner {
+    nodes: hashbrown::HashTable<&'static Node>,
+    hashes: ahash::RandomState,
+}
+
+static INTERN: LazyLock<std::sync::Mutex<Interner>> = LazyLock::new(Default::default);
 
 pub fn peel_op(filter: Filter) -> Op {
     peel_op_ref(filter).clone()
@@ -572,19 +578,25 @@ impl<'a> InMemoryBuilder<'a> {
 
 // Canonicalize an `Op` to its single interned node via structural equality. On a hit we
 // return the existing node and drop `op`; on a miss we leak a node (its `Op` lives for the
-// process) and borrow its immutable `Op` as the key. This avoids duplicating
-// every path/vector and keeps the hash-table entries small.
+// process). Its immutable Op supplies hash/equality directly, so the table only
+// stores one pointer per entry without a separate borrowed key.
 fn intern(op: Op) -> &'static Node {
     let mut intern = INTERN.lock().unwrap();
-    if let Some(node) = intern.get(&op) {
-        return node;
+    let Interner { nodes, hashes } = &mut *intern;
+    let hash = hashes.hash_one(&op);
+    // Store only the node pointer: the immutable Op already lives inside the node.
+    let entry = nodes.entry(hash, |node| node.op == op, |node| hashes.hash_one(&node.op));
+    match entry {
+        hashbrown::hash_table::Entry::Occupied(entry) => entry.get(),
+        hashbrown::hash_table::Entry::Vacant(entry) => {
+            let node: &'static Node = Box::leak(Box::new(Node {
+                op,
+                oid: OnceLock::new(),
+            }));
+            entry.insert(node);
+            node
+        }
     }
-    let node: &'static Node = Box::leak(Box::new(Node {
-        op,
-        oid: OnceLock::new(),
-    }));
-    intern.insert(&node.op, node);
-    node
 }
 
 pub fn to_filter(op: Op) -> Filter {
