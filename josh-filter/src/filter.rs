@@ -376,25 +376,68 @@ where
     I: IntoIterator<Item = P>,
     P: Into<std::path::PathBuf>,
 {
-    use std::collections::BTreeMap;
     #[cfg(not(unix))]
     use std::path::Component;
     use std::path::PathBuf;
 
-    #[derive(Default)]
-    struct Paths<'a> {
-        terminal: bool,
-        children: BTreeMap<&'a str, Paths<'a>>,
+    // Sort component references instead of allocating a map node for every
+    // directory/file. Original positions preserve ancestor overlay ordering.
+    fn build(paths: &[(&str, usize)]) -> Option<Filter> {
+        let mut components: Vec<_> = paths
+            .iter()
+            .map(|(path, position)| {
+                let (name, rest) = path
+                    .split_once('/')
+                    .map_or((*path, None), |(name, rest)| (name, Some(rest)));
+                (name, rest, *position)
+            })
+            .collect();
+        components.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut branches = Vec::new();
+        for group in components.chunk_by(|a, b| a.0 == b.0) {
+            let name = group[0].0;
+            let mut terminals = group.iter().filter(|(_, rest, _)| rest.is_none());
+            if let Some((_, _, position)) = terminals.next() {
+                if terminals.next().is_some() || group.iter().any(|(_, _, index)| index < position)
+                {
+                    return None;
+                }
+                branches.push(to_filter(Op::File(name.into(), name.into())));
+            }
+            let descendants: Vec<_> = group
+                .iter()
+                .filter_map(|(_, rest, position)| rest.map(|rest| (rest, *position)))
+                .collect();
+            if !descendants.is_empty() {
+                let inner = build(&descendants)?;
+                let mut chain = vec![to_filter(Op::Subdir(name.into()))];
+                match persist::to_op_ref(inner) {
+                    Op::Chain(nested) => chain.extend(nested.iter().copied()),
+                    _ => chain.push(inner),
+                }
+                chain.push(to_filter(Op::Prefix(name.into())));
+                branches.push(opt::remember_optimized(to_filter(Op::Chain(chain))));
+            }
+        }
+        Some(match branches.as_slice() {
+            [] => to_filter(Op::Empty),
+            [only] => *only,
+            _ => opt::remember_optimized(to_filter(Op::Compose(branches))),
+        })
     }
-    fn collect(paths: &[PathBuf]) -> Option<Paths<'_>> {
-        let mut root = Paths::default();
-        for path in paths {
+    let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
+    let canonical: Option<Vec<_>> = paths
+        .iter()
+        .enumerate()
+        .map(|(position, path)| {
             let text = path.to_str()?;
-            if text.is_empty() || text.contains('\0') {
+            if text.contains('\0')
+                || text
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == "..")
+            {
                 return None;
             }
-            // Non-Unix native paths may have additional separators and prefixes.
-            // On Unix, validate components while building the shared path tree.
             #[cfg(not(unix))]
             if !path
                 .components()
@@ -406,52 +449,11 @@ where
             {
                 return None;
             }
-            let mut node = &mut root;
-            for component in text.split('/') {
-                if component.is_empty() || component == "." || component == ".." {
-                    return None;
-                }
-                node = node.children.entry(component).or_default();
-            }
-            // Keep ancestor-before-descendant overlay order. Reversed overlaps
-            // and duplicate entries still use the general optimizer.
-            if node.terminal || !node.children.is_empty() {
-                return None;
-            }
-            node.terminal = true;
-        }
-        Some(root)
-    }
-    // Distinct sibling paths cannot overlap, so their BTreeMap order is the
-    // optimizer's source/destination order. Emit terminals before their descendants
-    // to preserve the accepted input order. Flatten single-child chains and
-    // collapse singleton compositions to construct its normal form directly.
-    fn build(paths: &Paths<'_>) -> Filter {
-        let mut branches = Vec::new();
-        for (name, child) in &paths.children {
-            if child.terminal {
-                branches.push(to_filter(Op::File((*name).into(), (*name).into())));
-            }
-            if !child.children.is_empty() {
-                let inner = build(child);
-                let mut chain = vec![to_filter(Op::Subdir((*name).into()))];
-                match persist::to_op_ref(inner) {
-                    Op::Chain(nested) => chain.extend(nested.iter().copied()),
-                    _ => chain.push(inner),
-                }
-                chain.push(to_filter(Op::Prefix((*name).into())));
-                branches.push(opt::remember_optimized(to_filter(Op::Chain(chain))));
-            }
-        }
-        match branches.as_slice() {
-            [] => to_filter(Op::Empty),
-            [only] => *only,
-            _ => opt::remember_optimized(to_filter(Op::Compose(branches))),
-        }
-    }
-    let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
-    if let Some(grouped) = collect(&paths) {
-        build(&grouped)
+            Some((text, position))
+        })
+        .collect();
+    if let Some(grouped) = canonical.and_then(|paths| build(&paths)) {
+        grouped
     } else {
         compose(
             &paths
