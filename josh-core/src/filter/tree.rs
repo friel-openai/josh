@@ -719,7 +719,17 @@ pub fn overlay(
         for entry in tree2.iter() {
             let (id, mode) =
                 if let Some(e) = tree1.get_name(entry.name().ok_or_else(|| anyhow!("no name"))?) {
-                    (overlay(transaction, e.id(), entry.id())?, e.filemode())
+                    // Preserve empty-tree precedence without reading leaf payloads.
+                    let child = if e.id() == empty_id() {
+                        entry.id()
+                    } else if e.kind() == Some(git2::ObjectType::Tree)
+                        && entry.kind() == Some(git2::ObjectType::Tree)
+                    {
+                        overlay(transaction, e.id(), entry.id())?
+                    } else {
+                        e.id()
+                    };
+                    (child, e.filemode())
                 } else {
                     (entry.id(), entry.filemode())
                 };
@@ -1182,6 +1192,87 @@ mod tests {
         cache::sled_load(td.path()).unwrap();
         let ctx = cache::TransactionContext::new(td.path(), cache::CacheStack::default().into());
         ctx.open().unwrap()
+    }
+
+    #[test]
+    fn overlay_entry_kinds_preserve_content_modes_and_empty_subtrees() {
+        // Compare with the prior OID-only traversal, including empty-tree precedence.
+        fn reference(repo: &git2::Repository, left: git2::Oid, right: git2::Oid) -> git2::Oid {
+            if left == right || right == empty_id() {
+                return left;
+            }
+            if left == empty_id() {
+                return right;
+            }
+            if let (Ok(left_tree), Ok(right_tree)) = (repo.find_tree(left), repo.find_tree(right)) {
+                let mut result = repo.treebuilder(Some(&left_tree)).unwrap();
+                for entry in right_tree.iter() {
+                    let name = entry.name().unwrap();
+                    let (child, mode) = if let Some(original) = left_tree.get_name(name) {
+                        (
+                            reference(repo, original.id(), entry.id()),
+                            original.filemode(),
+                        )
+                    } else {
+                        (entry.id(), entry.filemode())
+                    };
+                    result.insert(name, child, mode).unwrap();
+                }
+                result.write().unwrap()
+            } else {
+                left
+            }
+        }
+        let directory = tempfile::TempDir::new().unwrap();
+        git2::Repository::init_bare(directory.path()).unwrap();
+        let transaction = open_transaction(&directory);
+        let repo = transaction.repo();
+        let first = repo.blob(b"first contents").unwrap();
+        let second = repo.blob(b"changed contents").unwrap();
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        let mut nested = repo.treebuilder(None).unwrap();
+        nested.insert("shared", first, 0o100755).unwrap();
+        let first_tree = nested.write().unwrap();
+        nested.insert("shared", second, 0o100644).unwrap();
+        nested.insert("new", first, 0o100644).unwrap();
+        let second_tree = nested.write().unwrap();
+        let signature = git2::Signature::now("Example", "example@example.com").unwrap();
+        let commit = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "Submodule",
+                &repo.find_tree(empty).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let entries = [
+            (first, 0o100644),
+            (second, 0o100644),
+            (first, 0o100755),
+            (second, 0o120000),
+            (first_tree, 0o040000),
+            (second_tree, 0o040000),
+            (empty, 0o040000),
+            (commit, 0o160000),
+        ];
+        let mut trees = vec![empty];
+        for (oid, mode) in entries {
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert("same-name", oid, mode).unwrap();
+            tree.insert("unchanged", first, 0o100644).unwrap();
+            trees.push(tree.write().unwrap());
+        }
+        for left in &trees {
+            for right in &trees {
+                assert_eq!(
+                    overlay(&transaction, *left, *right).unwrap(),
+                    reference(repo, *left, *right),
+                    "{left} overlay {right}"
+                );
+            }
+        }
     }
 
     #[test]
