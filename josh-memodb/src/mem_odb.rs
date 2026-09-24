@@ -160,10 +160,12 @@ impl MemOdb {
             }
             // A stable tree-entry name groups similarly shaped trees for delta search.
             // This is only a packing hint: it never changes object bytes or ids. Copy
-            // the short hints before insertion, which reads through the same mutex.
-            let names: Vec<_> = {
+            // the short hints into one buffer before insertion, which reads through
+            // the same mutex. Byte ranges avoid an allocation for each hint.
+            let (names, ranges) = {
                 let inner = self.inner.lock().unwrap();
-                to_pack
+                let mut names = String::new();
+                let ranges: Vec<_> = to_pack
                     .iter()
                     .map(|oid| {
                         let (kind, data) = inner.map.get(oid)?;
@@ -171,12 +173,17 @@ impl MemOdb {
                             return None;
                         }
                         let end = data.iter().position(|byte| *byte == 0)?;
-                        std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+                        let name = std::str::from_utf8(&data[..end]).ok()?;
+                        let start = names.len();
+                        names.push_str(name);
+                        Some(start..names.len())
                     })
-                    .collect()
+                    .collect();
+                (names, ranges)
             };
-            for (oid, name) in to_pack.iter().zip(&names) {
-                pb.insert_object(*oid, name.as_deref())?;
+            for (oid, range) in to_pack.iter().zip(&ranges) {
+                let name = range.as_ref().map(|range| &names[range.clone()]);
+                pb.insert_object(*oid, name)?;
             }
             // `packfile_path` resolves the common object directory, so this is correct for linked
             // worktrees (whose gitdir has no `objects/` of its own) as well as normal repos.
@@ -303,7 +310,12 @@ mod tests {
         let mut trees = Vec::new();
         for index in 0..32 {
             let blob = repo.blob(format!("content {index}").as_bytes()).unwrap();
-            for name in [b"ordinary".as_slice(), b"bad\xff", b"space name"] {
+            for name in [
+                b"ordinary".as_slice(),
+                b"bad\xff",
+                b"space name",
+                "日本語".as_bytes(),
+            ] {
                 let mut builder = repo.treebuilder(None).unwrap();
                 builder.insert(name, blob, 0o100644).unwrap();
                 let oid = builder.write().unwrap();
