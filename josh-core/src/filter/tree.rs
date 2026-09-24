@@ -1025,8 +1025,12 @@ pub(super) fn select_identity_files<'a>(
         {
             return Ok(Some(output));
         }
-        let mut builder =
-            repo.treebuilder((selection == IdentitySelection::Remove).then_some(input))?;
+        let mut builder = if selection == IdentitySelection::Remove {
+            Some(repo.treebuilder(Some(input))?)
+        } else {
+            None
+        };
+        let mut kept = Vec::new();
         let mut changed = false;
         for (name, selected) in &mut paths.children {
             let Some(entry) = input.get_name(name) else {
@@ -1038,14 +1042,11 @@ pub(super) fn select_identity_files<'a>(
                 if entry.id() == empty_id() || entry.id().is_zero() {
                     continue;
                 }
-                match selection {
-                    IdentitySelection::Keep => {
-                        builder.insert(name, entry.id(), entry.filemode())?;
-                    }
-                    IdentitySelection::Remove => {
-                        changed = true;
-                        builder.remove(name)?;
-                    }
+                if let Some(builder) = &mut builder {
+                    changed = true;
+                    builder.remove(name)?;
+                } else {
+                    kept.push((*name, entry.id(), entry.filemode()));
                 }
             } else if entry.kind() == Some(git2::ObjectType::Tree) {
                 let subtree = repo.find_tree(entry.id())?;
@@ -1057,16 +1058,20 @@ pub(super) fn select_identity_files<'a>(
                 }
                 changed = true;
                 if output != empty_id() {
-                    builder.insert(name, output, 0o040000)?;
-                } else if selection == IdentitySelection::Remove {
+                    if let Some(builder) = &mut builder {
+                        builder.insert(name, output, 0o040000)?;
+                    } else {
+                        kept.push((*name, output, 0o040000));
+                    }
+                } else if let Some(builder) = &mut builder {
                     builder.remove(name)?;
                 }
             }
         }
-        let output = if selection == IdentitySelection::Remove && !changed {
-            input.id()
-        } else {
-            builder.write()?
+        let output = match builder {
+            Some(_) if !changed => input.id(),
+            Some(builder) => builder.write()?,
+            None => write_selected_entries(repo, kept)?,
         };
         transaction.insert_apply(key, input.id(), output);
         Ok(Some(output))
@@ -1163,6 +1168,40 @@ pub fn empty(repo: &git2::Repository) -> git2::Tree<'_> {
     repo.find_tree(empty_id()).unwrap()
 }
 
+/// Serialize unique selected names directly; uncommon names/modes retain libgit2 validation.
+/// Selection visits each name once, so no name-keyed treebuilder deduplication is needed.
+fn write_selected_entries(
+    repo: &git2::Repository,
+    entries: Vec<(&str, git2::Oid, i32)>,
+) -> anyhow::Result<git2::Oid> {
+    let ordinary = entries.iter().all(|(name, oid, mode)| {
+        !name.is_empty()
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
+            && !oid.is_zero()
+            && matches!(mode, 0o040000 | 0o100644 | 0o100755 | 0o120000 | 0o160000)
+    });
+    if !ordinary {
+        let mut builder = repo.treebuilder(None)?;
+        for (name, oid, mode) in entries {
+            builder.insert(name, oid, mode)?;
+        }
+        return Ok(builder.write()?);
+    }
+    let entries = entries
+        .into_iter()
+        .map(|(name, oid, mode)| gix_object::tree::Entry {
+            mode: gix_object::tree::EntryMode::try_from(mode as u32)
+                .expect("validated canonical tree mode"),
+            filename: name.into(),
+            oid: objects::gix_oid(oid),
+        })
+        .collect();
+    objects::write_tree_now(&repo.odb()?, entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,6 +1221,71 @@ mod tests {
         cache::sled_load(td.path()).unwrap();
         let ctx = cache::TransactionContext::new(td.path(), cache::CacheStack::default().into());
         ctx.open().unwrap()
+    }
+
+    #[test]
+    fn selected_serialization_matches_treebuilder_and_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(directory.path()).unwrap();
+        let transaction = open_transaction(&directory);
+        let repo = transaction.repo();
+        let blob = repo.blob(b"content").unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let missing = git2::Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let reference = |entries: &[(&str, git2::Oid, i32)]| -> anyhow::Result<git2::Oid> {
+            let mut builder = repo.treebuilder(None)?;
+            for (name, oid, mode) in entries {
+                builder.insert(name, *oid, *mode)?;
+            }
+            Ok(builder.write()?)
+        };
+        for name in [
+            "file",
+            "a-b_c.txt",
+            "a.b",
+            ".hidden",
+            "two words",
+            "é",
+            ".git",
+            ".GIT.",
+            "git~1",
+            "a/b",
+            "",
+            ".",
+            "..",
+            "nul\0name",
+        ] {
+            for (oid, mode) in [
+                (blob, 0o100644),
+                (blob, 0o100755),
+                (blob, 0o120000),
+                (tree, 0o040000),
+                (missing, 0o160000),
+                (blob, 0o100600),
+                (git2::Oid::zero(), 0o100644),
+            ] {
+                let entries = vec![(name, oid, mode)];
+                assert_eq!(
+                    write_selected_entries(repo, entries.clone()).map_err(|e| e.to_string()),
+                    reference(&entries).map_err(|e| e.to_string()),
+                    "{name:?} mode {mode:o}"
+                );
+            }
+        }
+        for entries in [
+            vec![],
+            vec![
+                ("a.b", blob, 0o100755),
+                ("a", tree, 0o040000),
+                ("z", blob, 0o120000),
+            ],
+            vec![(".hidden", blob, 0o100644), ("a", tree, 0o040000)],
+        ] {
+            assert_eq!(
+                write_selected_entries(repo, entries.clone()).unwrap(),
+                reference(&entries).unwrap()
+            );
+        }
     }
 
     #[test]
