@@ -1492,6 +1492,11 @@ pub fn apply<'a>(
             Ok(x.with_tree(repo.find_tree(tree::subtract(transaction, af.tree().id(), ba)?)?))
         }
         Op::Exclude(b) => {
+            if let Some(selected) =
+                tree::select_identity_files(repo, x.tree(), &[*b], tree::IdentitySelection::Remove)?
+            {
+                return Ok(x.with_tree(selected));
+            }
             let bf = apply(transaction, *b, x.clone())?.tree().id();
             Ok(x.clone().with_tree(repo.find_tree(tree::subtract(
                 transaction,
@@ -1592,6 +1597,11 @@ pub fn apply<'a>(
         }
 
         Op::Compose(filters) => {
+            if let Some(selected) =
+                tree::select_identity_files(repo, x.tree(), filters, tree::IdentitySelection::Keep)?
+            {
+                return Ok(x.with_tree(selected));
+            }
             let filtered: Vec<_> = filters
                 .iter()
                 .map(|f| apply(transaction, *f, x.clone()))
