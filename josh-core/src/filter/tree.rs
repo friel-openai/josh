@@ -891,7 +891,7 @@ pub(super) fn select_identity_files<'a>(
     #[derive(Default)]
     struct Paths {
         terminal: bool,
-        children: std::collections::BTreeMap<&'static str, Paths>,
+        children: Vec<(&'static str, Paths)>,
     }
     fn descend<'a>(mut node: &'a mut Paths, path: &'static Path) -> Option<&'a mut Paths> {
         let path = path.to_str()?;
@@ -903,7 +903,18 @@ pub(super) fn select_identity_files<'a>(
             {
                 return None;
             }
-            node = node.children.entry(component).or_default();
+            // Keep child records contiguous while preserving sorted traversal.
+            let index = match node
+                .children
+                .binary_search_by(|(name, _)| name.cmp(&component))
+            {
+                Ok(index) => index,
+                Err(index) => {
+                    node.children.insert(index, (component, Paths::default()));
+                    index
+                }
+            };
+            node = &mut node.children[index].1;
         }
         Some(node)
     }
