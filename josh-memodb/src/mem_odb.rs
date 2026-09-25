@@ -36,6 +36,7 @@ struct Inner {
 pub struct MemOdb {
     inner: Mutex<Inner>,
     limit: Option<usize>,
+    pack_threads: Option<u32>,
     /// Repository the store is registered on, re-opened by the background flusher to run the
     /// packbuilder (a `git2::Repository` is not `Send`).
     repo_path: PathBuf,
@@ -50,12 +51,27 @@ impl MemOdb {
     /// transaction and the libgit2 backend registered on its repository. `limit` bounds the total
     /// buffered object data: once exceeded the store flushes itself to a packfile (`None` = unbounded).
     pub fn new(limit: Option<usize>, repo_path: PathBuf) -> Arc<MemOdb> {
+        Self::create(limit, repo_path, None)
+    }
+
+    /// Set workers for this store without changing repository configuration.
+    /// Zero asks libgit2 to detect CPUs; omission keeps its single-worker default.
+    pub fn new_with_pack_threads(
+        limit: Option<usize>,
+        repo_path: PathBuf,
+        threads: u32,
+    ) -> Arc<MemOdb> {
+        Self::create(limit, repo_path, Some(threads))
+    }
+
+    fn create(limit: Option<usize>, repo_path: PathBuf, pack_threads: Option<u32>) -> Arc<MemOdb> {
         Arc::new(MemOdb {
             inner: Mutex::new(Inner {
                 map: Default::default(),
                 size: 0,
             }),
             limit,
+            pack_threads,
             repo_path,
             chunk_in_flight: AtomicBool::new(false),
         })
@@ -145,6 +161,10 @@ impl MemOdb {
         let to_pack = odb_backend::filter_absent_on_disk(&repo, &oids);
         if !to_pack.is_empty() {
             let mut pb = repo.packbuilder()?;
+            // Preserve libgit2's single-worker default unless this store opts in.
+            if let Some(threads) = self.pack_threads {
+                pb.set_threads(threads);
+            }
             // The last tree-entry name groups similarly shaped trees for delta search.
             // Walk record boundaries without interpreting modes or rewriting any bytes.
             // This is only a packing hint: it never changes object bytes or ids. Copy
@@ -329,6 +349,31 @@ mod tests {
             assert_eq!(object.kind(), ObjectType::Tree);
             assert_eq!(object.data(), bytes);
         }
+    }
+
+    #[test]
+    fn explicit_workers_preserve_objects_without_changing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        repo.config().unwrap().set_i32("pack.threads", -1).unwrap();
+        let store = MemOdb::new_with_pack_threads(Some(16), repo.path().to_owned(), 4);
+        store.register(&repo);
+        // Exercise the overflow flusher's reopened repository as well as the final drain.
+        let first = repo.blob(&b"overflow".repeat(100)).unwrap();
+        assert!(wait_on_disk(directory.path(), first));
+        let contents: Vec<_> = (0..200)
+            .map(|index| format!("{}-{index}", "similar packed content".repeat(100)))
+            .collect();
+        let ids: Vec<_> = contents
+            .iter()
+            .map(|content| repo.blob(content.as_bytes()).unwrap())
+            .collect();
+        store.flush().unwrap();
+        let fresh = git2::Repository::open_bare(directory.path()).unwrap();
+        for (id, content) in ids.iter().zip(&contents) {
+            assert_eq!(fresh.find_blob(*id).unwrap().content(), content.as_bytes());
+        }
+        assert_eq!(fresh.config().unwrap().get_i32("pack.threads").unwrap(), -1);
     }
 
     /// A linked worktree's gitdir has no `objects/` of its own, so the flush must write into the
