@@ -954,7 +954,7 @@ pub(super) fn select_identity_files<'a>(
         input: &git2::Tree<'_>,
         paths: &Paths,
         selection: IdentitySelection,
-    ) -> anyhow::Result<Option<git2::Oid>> {
+    ) -> anyhow::Result<git2::Oid> {
         let mut builder =
             repo.treebuilder((selection == IdentitySelection::Remove).then_some(input))?;
         let mut changed = false;
@@ -979,9 +979,7 @@ pub(super) fn select_identity_files<'a>(
                 }
             } else if entry.kind() == Some(git2::ObjectType::Tree) {
                 let subtree = repo.find_tree(entry.id())?;
-                let Some(output) = select(repo, &subtree, selected, selection)? else {
-                    return Ok(None);
-                };
+                let output = select(repo, &subtree, selected, selection)?;
                 if selection == IdentitySelection::Remove && output == entry.id() {
                     continue;
                 }
@@ -994,13 +992,13 @@ pub(super) fn select_identity_files<'a>(
             }
         }
         if selection == IdentitySelection::Remove && !changed {
-            return Ok(Some(input.id()));
+            return Ok(input.id());
         }
-        Ok(Some(builder.write()?))
+        Ok(builder.write()?)
     }
-    select(repo, input, &paths, selection)?
-        .map(|oid| repo.find_tree(oid).map_err(Into::into))
-        .transpose()
+    Ok(Some(
+        repo.find_tree(select(repo, input, &paths, selection)?)?,
+    ))
 }
 
 pub fn compose_fast(
