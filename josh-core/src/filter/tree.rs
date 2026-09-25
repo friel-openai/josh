@@ -955,9 +955,12 @@ pub(super) fn select_identity_files<'a>(
         paths: &Paths,
         selection: IdentitySelection,
     ) -> anyhow::Result<Option<git2::Oid>> {
-        let mut builder =
-            repo.treebuilder((selection == IdentitySelection::Remove).then_some(input))?;
-        let mut changed = false;
+        // Exclusions often leave a subtree unchanged. Copy its entries into a
+        // builder only after finding an entry that actually needs to change.
+        let mut builder = match selection {
+            IdentitySelection::Keep => Some(repo.treebuilder(None)?),
+            IdentitySelection::Remove => None,
+        };
         for (name, selected) in &paths.children {
             let Some(entry) = input.get_name(name) else {
                 continue;
@@ -970,11 +973,16 @@ pub(super) fn select_identity_files<'a>(
                 }
                 match selection {
                     IdentitySelection::Keep => {
-                        builder.insert(name, entry.id(), entry.filemode())?;
+                        builder
+                            .as_mut()
+                            .unwrap()
+                            .insert(name, entry.id(), entry.filemode())?;
                     }
                     IdentitySelection::Remove => {
-                        changed = true;
-                        builder.remove(name)?;
+                        if builder.is_none() {
+                            builder = Some(repo.treebuilder(Some(input))?);
+                        }
+                        builder.as_mut().unwrap().remove(name)?;
                     }
                 }
             } else if entry.kind() == Some(git2::ObjectType::Tree) {
@@ -985,18 +993,20 @@ pub(super) fn select_identity_files<'a>(
                 if selection == IdentitySelection::Remove && output == entry.id() {
                     continue;
                 }
-                changed = true;
+                if builder.is_none() {
+                    builder = Some(repo.treebuilder(Some(input))?);
+                }
                 if output != empty_id() {
-                    builder.insert(name, output, 0o040000)?;
+                    builder.as_mut().unwrap().insert(name, output, 0o040000)?;
                 } else if selection == IdentitySelection::Remove {
-                    builder.remove(name)?;
+                    builder.as_mut().unwrap().remove(name)?;
                 }
             }
         }
-        if selection == IdentitySelection::Remove && !changed {
-            return Ok(Some(input.id()));
-        }
-        Ok(Some(builder.write()?))
+        Ok(Some(match builder {
+            Some(builder) => builder.write()?,
+            None => input.id(),
+        }))
     }
     select(repo, input, &paths, selection)?
         .map(|oid| repo.find_tree(oid).map_err(Into::into))
@@ -1235,6 +1245,45 @@ mod tests {
                     .id(),
                 expected,
                 "optimized subset {seed}"
+            );
+        }
+        // An empty policy, absent leaves, and terminal empty trees all leave
+        // exclusions unchanged. Compare against the general implementation.
+        for excluded_paths in [
+            vec![],
+            vec!["absent"],
+            vec!["a/missing", "empty/missing", "root/impossible"],
+            vec!["a/empty", "empty"],
+        ] {
+            let filters: Vec<_> = excluded_paths
+                .iter()
+                .map(|path| to_filter(Op::File((*path).into(), (*path).into())))
+                .collect();
+            let applied: Vec<_> = filters
+                .iter()
+                .map(|filter| {
+                    apply(&transaction, *filter, Rewrite::from_tree(input.clone()))
+                        .unwrap()
+                        .tree()
+                        .clone()
+                })
+                .collect();
+            let selected = compose(&transaction, filters.iter().zip(applied).collect())
+                .unwrap()
+                .id();
+            let expected = subtract(&transaction, source, selected).unwrap();
+            assert_eq!(expected, source);
+            assert_eq!(
+                select_identity_files(
+                    transaction.repo(),
+                    &input,
+                    &filters,
+                    IdentitySelection::Remove,
+                )
+                .unwrap()
+                .unwrap()
+                .id(),
+                expected,
             );
         }
         for filters in [
