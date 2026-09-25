@@ -145,7 +145,8 @@ impl MemOdb {
         let to_pack = odb_backend::filter_absent_on_disk(&repo, &oids);
         if !to_pack.is_empty() {
             let mut pb = repo.packbuilder()?;
-            // A stable tree-entry name groups similarly shaped trees for delta search.
+            // The last tree-entry name groups similarly shaped trees for delta search.
+            // Walk record boundaries without interpreting modes or rewriting any bytes.
             // This is only a packing hint: it never changes object bytes or ids. Copy
             // the short hints before insertion, which reads through the same mutex.
             let names: Vec<_> = {
@@ -157,8 +158,14 @@ impl MemOdb {
                         if *kind != raw::GIT_OBJECT_TREE {
                             return None;
                         }
-                        let end = data.iter().position(|byte| *byte == 0)?;
-                        std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+                        let mut remaining = data.as_ref();
+                        let mut name = None;
+                        while !remaining.is_empty() {
+                            let end = remaining.iter().position(|byte| *byte == 0)?;
+                            name = std::str::from_utf8(&remaining[..end]).ok();
+                            remaining = remaining.get(end + 1 + Oid::zero().as_bytes().len()..)?;
+                        }
+                        name.map(str::to_owned)
                     })
                     .collect()
             };
@@ -293,6 +300,20 @@ mod tests {
             for name in [b"ordinary".as_slice(), b"bad\xff", b"space name"] {
                 let mut builder = repo.treebuilder(None).unwrap();
                 builder.insert(name, blob, 0o100644).unwrap();
+                let oid = builder.write().unwrap();
+                let bytes = repo.odb().unwrap().read(oid).unwrap().data().to_vec();
+                trees.push((oid, bytes));
+            }
+            // Exercise the full record walk and both a valid and invalid UTF-8 tail.
+            for names in [
+                [b"a".as_slice(), b"z".as_slice()],
+                [b"a".as_slice(), b"z\xff".as_slice()],
+                [b"a\xff".as_slice(), b"z".as_slice()],
+            ] {
+                let mut builder = repo.treebuilder(None).unwrap();
+                for name in names {
+                    builder.insert(name, blob, 0o100644).unwrap();
+                }
                 let oid = builder.write().unwrap();
                 let bytes = repo.odb().unwrap().read(oid).unwrap().data().to_vec();
                 trees.push((oid, bytes));
