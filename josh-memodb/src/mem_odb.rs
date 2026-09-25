@@ -158,7 +158,7 @@ impl MemOdb {
                 Err(error) if error.code() == git2::ErrorCode::NotFound => {}
                 Err(error) => return Err(error),
             }
-            // A stable tree-entry name groups similarly shaped trees for delta search.
+            // Names from both ends distinguish similarly shaped trees for delta search.
             // This is only a packing hint: it never changes object bytes or ids. Copy
             // the short hints before insertion, which reads through the same mutex.
             let names: Vec<_> = {
@@ -170,8 +170,24 @@ impl MemOdb {
                         if *kind != raw::GIT_OBJECT_TREE {
                             return None;
                         }
-                        let end = data.iter().position(|byte| *byte == 0)?;
-                        std::str::from_utf8(&data[..end]).ok().map(str::to_owned)
+                        let mut records = &data[..];
+                        let mut first = None;
+                        let mut last = "";
+                        while !records.is_empty() {
+                            let end = records.iter().position(|byte| *byte == 0)?;
+                            let header = std::str::from_utf8(&records[..end]).ok()?;
+                            let (_, name) = header.split_once(' ')?;
+                            first.get_or_insert(name);
+                            last = name;
+                            // Skip the NUL and raw SHA-1 without interpreting object contents.
+                            records = records.get(end.checked_add(21)?..)?;
+                        }
+                        let first = first?;
+                        // libgit2 weights the final sixteen non-space bytes of a name.
+                        // Keep both halves within that window without splitting UTF-8.
+                        let first = &first[..first.floor_char_boundary(8)];
+                        let last = &last[last.ceil_char_boundary(last.len().saturating_sub(8))..];
+                        Some(format!("{first}{last}"))
                     })
                     .collect()
             };
@@ -310,6 +326,13 @@ mod tests {
                 let bytes = repo.odb().unwrap().read(oid).unwrap().data().to_vec();
                 trees.push((oid, bytes));
             }
+            let mut builder = repo.treebuilder(None).unwrap();
+            for name in ["αρχή-eight", "路径-middle", "尾部-end-🌲"] {
+                builder.insert(name, blob, 0o100644).unwrap();
+            }
+            let oid = builder.write().unwrap();
+            let bytes = repo.odb().unwrap().read(oid).unwrap().data().to_vec();
+            trees.push((oid, bytes));
         }
         let empty = repo.treebuilder(None).unwrap().write().unwrap();
         trees.push((empty, Vec::new()));
