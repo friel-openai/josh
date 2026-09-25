@@ -1091,7 +1091,12 @@ pub fn get_blob(repo: &git2::Repository, tree: &git2::Tree, path: &Path) -> Stri
 }
 
 pub fn empty_id() -> git2::Oid {
-    git2::Oid::from_str("4b825dc642cb6eb9a060e54bf8d69288fbee4904").unwrap()
+    // The empty tree ID is fixed; avoid parsing forty hex digits on every check.
+    git2::Oid::from_bytes(&[
+        0x4b, 0x82, 0x5d, 0xc6, 0x42, 0xcb, 0x6e, 0xb9, 0xa0, 0x60, 0xe5, 0x4b, 0xf8, 0xd6, 0x92,
+        0x88, 0xfb, 0xee, 0x49, 0x04,
+    ])
+    .unwrap()
 }
 
 pub fn empty(repo: &git2::Repository) -> git2::Tree<'_> {
