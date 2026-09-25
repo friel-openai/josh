@@ -162,10 +162,13 @@ impl MemOdb {
                         let mut name = None;
                         while !remaining.is_empty() {
                             let end = remaining.iter().position(|byte| *byte == 0)?;
-                            name = std::str::from_utf8(&remaining[..end]).ok();
+                            name = Some(&remaining[..end]);
                             remaining = remaining.get(end + 1 + Oid::zero().as_bytes().len()..)?;
                         }
-                        name.map(str::to_owned)
+                        // Only the final entry contributes a hint. Earlier names need
+                        // record-boundary checks, but no UTF-8 decoding.
+                        name.and_then(|name| std::str::from_utf8(name).ok())
+                            .map(str::to_owned)
                     })
                     .collect()
             };
