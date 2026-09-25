@@ -28,10 +28,6 @@ type FilterHashMap = HashMap<Filter, Filter, BuildHasherDefault<PassthroughHashe
 type FilterSet = HashSet<Filter, BuildHasherDefault<PassthroughHasher>>;
 type InvertHashMap = HashMap<Filter, Option<Filter>, BuildHasherDefault<PassthroughHasher>>;
 
-// A single rewrite step is not a fully optimized result.
-static STEPPED: LazyLock<std::sync::Mutex<FilterHashMap>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
-
 static OPTIMIZED: LazyLock<std::sync::Mutex<FilterHashMap>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
 static MINIMIZED: LazyLock<std::sync::Mutex<FilterHashMap>> =
