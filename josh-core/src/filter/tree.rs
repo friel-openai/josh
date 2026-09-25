@@ -903,11 +903,16 @@ pub(super) fn select_identity_files<'a>(
             {
                 return None;
             }
-            // Keep child records contiguous while preserving sorted traversal.
-            let index = match node
-                .children
-                .binary_search_by(|(name, _)| name.cmp(&component))
-            {
+            // Sorted paths usually reuse or append the last child. Other orders
+            // retain the same binary search and sorted insertion semantics.
+            let position = match node.children.last().map(|(name, _)| name.cmp(&component)) {
+                Some(std::cmp::Ordering::Equal) => Ok(node.children.len() - 1),
+                None | Some(std::cmp::Ordering::Less) => Err(node.children.len()),
+                Some(std::cmp::Ordering::Greater) => node
+                    .children
+                    .binary_search_by(|(name, _)| name.cmp(&component)),
+            };
+            let index = match position {
                 Ok(index) => index,
                 Err(index) => {
                     node.children.insert(index, (component, Paths::default()));
