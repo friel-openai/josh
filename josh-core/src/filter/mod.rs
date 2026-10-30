@@ -2185,14 +2185,20 @@ fn per_rev_filter(
                 Rewrite::from_commit(commit)?,
             )?;
 
-            let parent = transaction.repo().find_commit(parent)?;
+            // A zero filtered parent contributes an empty tree. Keep the
+            // subtraction below: skipping pin handling would expose the
+            // current pinned blob. Do not borrow a later parent's contents.
+            let parent_tree = if parent.is_zero() {
+                tree::empty(transaction.repo()).id()
+            } else {
+                transaction.repo().find_commit(parent)?.tree_id()
+            };
 
             // Re-content the pinned path set from the parent's filtered tree: keep exactly the
             // parent's entries whose path is pinned. Equivalent to the older
             // `populate(pathstree(pin_subtract), parent)` spelling of "select the pinned paths out
             // of the previous tree", but in a single path-intersection pass.
-            let pin_overlay =
-                tree::intersect(transaction, parent.tree_id(), pin_subtract.tree.id())?;
+            let pin_overlay = tree::intersect(transaction, parent_tree, pin_subtract.tree.id())?;
 
             Some((pin_subtract.tree.id(), pin_overlay))
         } else {
@@ -2468,6 +2474,101 @@ mod tests {
     use super::*;
     use crate::cache::CacheBackend;
     use std::path::PathBuf;
+
+    #[test]
+    fn pins_use_empty_tree_when_first_filtered_parent_is_zero() {
+        for truncate_first in [false, true] {
+            for include_second in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let repo = git2::Repository::init_bare(directory.path()).unwrap();
+                let signature = git2::Signature::now("test", "test@example.com").unwrap();
+                let make_tree = |pinned: &[u8]| {
+                    let mut builder = repo.treebuilder(None).unwrap();
+                    builder
+                        .insert("pinned", repo.blob(pinned).unwrap(), 0o100644)
+                        .unwrap();
+                    builder
+                        .insert("visible", repo.blob(b"visible").unwrap(), 0o100644)
+                        .unwrap();
+                    repo.find_tree(builder.write().unwrap()).unwrap()
+                };
+                let parent_tree = make_tree(b"approved");
+                let parent = repo
+                    .commit(None, &signature, &signature, "first", &parent_tree, &[])
+                    .unwrap();
+                let second = repo
+                    .commit(None, &signature, &signature, "second", &parent_tree, &[])
+                    .unwrap();
+                let parent_commit = repo.find_commit(parent).unwrap();
+                let second_commit = repo.find_commit(second).unwrap();
+                let mut parents = vec![&parent_commit];
+                if include_second {
+                    parents.push(&second_commit);
+                }
+                let current_tree = make_tree(b"unapproved");
+                let current = repo
+                    .commit(
+                        None,
+                        &signature,
+                        &signature,
+                        "current",
+                        &current_tree,
+                        &parents,
+                    )
+                    .unwrap();
+                cache::sled_load(directory.path()).unwrap();
+                let stack = std::sync::Arc::new(
+                    cache::CacheStack::new().with_backend(cache::SledCacheBackend::default()),
+                );
+                let context = cache::TransactionContext::new(directory.path(), stack);
+                let transaction = context.open().unwrap();
+                let outer = parse(":hook=test")
+                    .unwrap()
+                    .with_meta("history", "no-splice");
+                transaction
+                    .insert(
+                        outer,
+                        parent,
+                        if truncate_first {
+                            git2::Oid::zero()
+                        } else {
+                            parent
+                        },
+                        false,
+                    )
+                    .unwrap();
+                transaction.insert(outer, second, second, false).unwrap();
+                let pinned_filter = Filter::new()
+                    .pin(Filter::new().file("pinned"))
+                    .with_meta("history", "no-splice");
+                let filtered = per_rev_filter(
+                    &transaction,
+                    &repo.find_commit(current).unwrap(),
+                    outer,
+                    pinned_filter,
+                    Vec::new(),
+                )
+                .unwrap()
+                .unwrap();
+                let tree = transaction
+                    .repo()
+                    .find_commit(filtered)
+                    .unwrap()
+                    .tree()
+                    .unwrap();
+                assert!(tree.get_name("visible").is_some());
+                if truncate_first {
+                    // Do not resurrect the current blob or use the second parent.
+                    assert!(tree.get_name("pinned").is_none());
+                } else {
+                    assert_eq!(
+                        tree.get_name("pinned").unwrap().id(),
+                        parent_tree.get_name("pinned").unwrap().id()
+                    );
+                }
+            }
+        }
+    }
 
     fn filter_unsampled_endpoint(
         force_cache: bool,
