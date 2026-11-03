@@ -39,6 +39,7 @@ pub struct TransactionContext {
     cache: std::sync::Arc<CacheStack>,
     ref_prefix: Option<String>,
     mem_odb_limit: Option<usize>,
+    mem_odb_pack_threads: Option<u32>,
     ephemeral: bool,
 }
 
@@ -52,6 +53,7 @@ impl TransactionContext {
             cache,
             ref_prefix: None,
             mem_odb_limit: None,
+            mem_odb_pack_threads: None,
             ephemeral: false,
         })
     }
@@ -62,6 +64,7 @@ impl TransactionContext {
             cache,
             ref_prefix: None,
             mem_odb_limit: None,
+            mem_odb_pack_threads: None,
             ephemeral: false,
         }
     }
@@ -73,6 +76,13 @@ impl TransactionContext {
 
     pub fn with_mem_odb_limit(mut self, limit: usize) -> Self {
         self.mem_odb_limit = Some(limit);
+        self
+    }
+
+    /// Override packing workers for this transaction and its clones, without writing Git config.
+    /// Zero asks libgit2 to detect CPUs; omission preserves its single-worker default.
+    pub fn with_mem_odb_pack_threads(mut self, threads: u32) -> Self {
+        self.mem_odb_pack_threads = Some(threads);
         self
     }
 
@@ -96,6 +106,7 @@ impl TransactionContext {
             self.cache.clone(),
             self.ref_prefix.as_deref(),
             self.mem_odb_limit,
+            self.mem_odb_pack_threads,
             self.ephemeral,
         ))
     }
@@ -131,6 +142,7 @@ pub struct Transaction {
     /// another transaction.
     mem_odb: std::sync::Arc<josh_memodb::MemOdb>,
     mem_odb_limit: Option<usize>,
+    mem_odb_pack_threads: Option<u32>,
     ephemeral: bool,
     ref_prefix: Option<String>,
     filter_hook: Option<std::sync::Arc<dyn FilterHook + Send + Sync>>,
@@ -155,6 +167,7 @@ impl Transaction {
         cache: std::sync::Arc<CacheStack>,
         ref_prefix: Option<&str>,
         mem_odb_limit: Option<usize>,
+        mem_odb_pack_threads: Option<u32>,
         ephemeral: bool,
     ) -> Transaction {
         // Turn off libgit2's strictness checks. These are process-wide C globals, set
@@ -172,7 +185,14 @@ impl Transaction {
             git2::opts::strict_hash_verification(false);
         });
 
-        let mem_odb = josh_memodb::MemOdb::new(mem_odb_limit, repo.path().to_owned());
+        let mem_odb = match mem_odb_pack_threads {
+            Some(threads) => josh_memodb::MemOdb::new_with_pack_threads(
+                mem_odb_limit,
+                repo.path().to_owned(),
+                threads,
+            ),
+            None => josh_memodb::MemOdb::new(mem_odb_limit, repo.path().to_owned()),
+        };
         mem_odb.register(&repo);
 
         log::debug!("new transaction");
@@ -203,6 +223,7 @@ impl Transaction {
             repo,
             mem_odb,
             mem_odb_limit,
+            mem_odb_pack_threads,
             ephemeral,
             ref_prefix: ref_prefix.map(|prefix| prefix.to_owned()),
             filter_hook: None,
@@ -215,6 +236,7 @@ impl Transaction {
             path: self.repo.path().to_owned(),
             ref_prefix: self.ref_prefix.clone(),
             mem_odb_limit: self.mem_odb_limit,
+            mem_odb_pack_threads: self.mem_odb_pack_threads,
             ephemeral: self.ephemeral,
         };
 
@@ -648,5 +670,37 @@ impl josh_search::IndexCache for Transaction {
 
     fn set_index(&self, tree: git2::Oid, index: git2::Oid) {
         self.insert_trigram_index(tree, index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloned_transactions_keep_explicit_pack_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        repo.config().unwrap().set_i32("pack.threads", -1).unwrap();
+        crate::cache::sled_load(directory.path()).unwrap();
+        let context = TransactionContext::new(directory.path(), CacheStack::default().into())
+            .with_mem_odb_limit(128 * 1024 * 1024)
+            .with_mem_odb_pack_threads(4);
+        let transaction = context.open().unwrap();
+        let first = transaction.repo().blob(b"original transaction").unwrap();
+        transaction.flush_mem_odb().unwrap();
+        let cloned = transaction.try_clone().unwrap();
+        let second = cloned.repo().blob(b"cloned transaction").unwrap();
+        cloned.flush_mem_odb().unwrap();
+        let fresh = git2::Repository::open_bare(directory.path()).unwrap();
+        assert_eq!(
+            fresh.find_blob(first).unwrap().content(),
+            b"original transaction"
+        );
+        assert_eq!(
+            fresh.find_blob(second).unwrap().content(),
+            b"cloned transaction"
+        );
+        assert_eq!(fresh.config().unwrap().get_i32("pack.threads").unwrap(), -1);
     }
 }

@@ -531,7 +531,17 @@ pub fn intersect(
         for entry in tree2.iter() {
             let name = entry.name().ok_or_else(|| anyhow!("no name"))?;
             if let Some(e1) = tree1.get_name(name) {
-                let child = intersect(transaction, e1.id(), entry.id())?;
+                // Entry kinds already tell us whether recursion can find two
+                // trees. Trying find_tree on a blob first reads its full data.
+                let child = if e1.kind() == Some(git2::ObjectType::Tree)
+                    && entry.kind() == Some(git2::ObjectType::Tree)
+                {
+                    intersect(transaction, e1.id(), entry.id())?
+                } else if entry.id() == empty_id() {
+                    empty_id()
+                } else {
+                    e1.id()
+                };
                 if child != empty_id() && child != git2::Oid::zero() {
                     builder.insert(name, child, e1.filemode()).ok();
                 }
@@ -860,6 +870,162 @@ pub fn populate(
     Ok(result_tree)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IdentitySelection {
+    Keep,
+    Remove,
+}
+
+/// Select a composition of identity file filters without materializing one tree per file.
+/// File filters may select whole directories; a terminal path includes its subtree.
+/// Return None when the general evaluator must handle a filter or tree operation.
+/// The filter itself is unchanged, including its persistent cache key.
+pub(super) fn select_identity_files<'a>(
+    repo: &'a git2::Repository,
+    input: &git2::Tree<'a>,
+    filters: &[Filter],
+    selection: IdentitySelection,
+) -> Option<git2::Tree<'a>> {
+    // Filter nodes are immutable and interned. Borrow path components rather than
+    // cloning every path each time a tree is selected.
+    #[derive(Default)]
+    struct Paths {
+        terminal: bool,
+        children: std::collections::BTreeMap<&'static str, Paths>,
+    }
+    fn descend<'a>(mut node: &'a mut Paths, path: &'static Path) -> Option<&'a mut Paths> {
+        let text = path.to_str()?;
+        #[cfg(windows)]
+        if text.contains('\\')
+            || matches!(
+                path.components().next(),
+                Some(std::path::Component::Prefix(_))
+            )
+        {
+            return None;
+        }
+        for component in text.split('/') {
+            if component.is_empty()
+                || component == "."
+                || component == ".."
+                || component.contains('\0')
+            {
+                return None;
+            }
+            node = node.children.entry(component).or_default();
+        }
+        Some(node)
+    }
+    fn collect(filter: Filter, paths: &mut Paths) -> Option<()> {
+        match josh_filter::persist::to_op_ref(filter) {
+            // Path equality can ignore separators and `/.` that Git rejects on insertion.
+            Op::File(destination, source) if destination.as_os_str() == source.as_os_str() => {
+                descend(paths, source)?.terminal = true;
+                Some(())
+            }
+            Op::Compose(filters) => {
+                for filter in filters {
+                    collect(*filter, paths)?;
+                }
+                Some(())
+            }
+            Op::Chain(filters) => collect_chain(filters, paths),
+            _ => None,
+        }
+    }
+    fn collect_chain(filters: &[Filter], paths: &mut Paths) -> Option<()> {
+        if let [filter] = filters {
+            return collect(*filter, paths);
+        }
+        // The optimizer factors identity selections into Subdir / selection / Prefix.
+        // Accept only matching wrappers, recursively, so renames and other transforms
+        // retain the general Compose implementation and its uniqueness rules.
+        if filters.len() < 3 {
+            return None;
+        }
+        match (
+            josh_filter::persist::to_op_ref(filters[0]),
+            josh_filter::persist::to_op_ref(*filters.last()?),
+        ) {
+            (Op::Subdir(source), Op::Prefix(destination))
+                if source.as_os_str() == destination.as_os_str() =>
+            {
+                collect_chain(&filters[1..filters.len() - 1], descend(paths, source)?)
+            }
+            _ => None,
+        }
+    }
+    let mut paths = Paths::default();
+    for filter in filters {
+        collect(*filter, &mut paths)?;
+    }
+    fn select(
+        repo: &git2::Repository,
+        input: &git2::Tree<'_>,
+        paths: &Paths,
+        selection: IdentitySelection,
+    ) -> Option<git2::Oid> {
+        // Exclusions often leave a subtree unchanged. Copy its entries into a
+        // builder only after finding an entry that actually needs to change.
+        let mut builder = match selection {
+            IdentitySelection::Keep => Some(repo.treebuilder(None).ok()?),
+            IdentitySelection::Remove => None,
+        };
+        for (name, selected) in &paths.children {
+            let Some(entry) = input.get_name(name) else {
+                continue;
+            };
+            if selected.terminal {
+                // File(path) also selects whole directories. Empty trees are omitted
+                // by the general insert path, so they select nothing here as well.
+                if entry.id() == empty_id() || entry.id().is_zero() {
+                    continue;
+                }
+                match selection {
+                    IdentitySelection::Keep => {
+                        builder
+                            .as_mut()
+                            .unwrap()
+                            .insert(name, entry.id(), entry.filemode())
+                            .ok()?;
+                    }
+                    IdentitySelection::Remove => {
+                        if builder.is_none() {
+                            builder = Some(repo.treebuilder(Some(input)).ok()?);
+                        }
+                        let builder = builder.as_mut().unwrap();
+                        // Exclude builds a selector first. Validate the entry as that selector
+                        // would, since remove alone accepts names that insert rejects.
+                        builder.insert(name, entry.id(), entry.filemode()).ok()?;
+                        builder.remove(name).ok()?;
+                    }
+                }
+            } else if entry.kind() == Some(git2::ObjectType::Tree) {
+                let subtree = repo.find_tree(entry.id()).ok()?;
+                let output = select(repo, &subtree, selected, selection)?;
+                if selection == IdentitySelection::Remove && output == entry.id() {
+                    continue;
+                }
+                if builder.is_none() {
+                    builder = Some(repo.treebuilder(Some(input)).ok()?);
+                }
+                let builder = builder.as_mut().unwrap();
+                if output != empty_id() {
+                    builder.insert(name, output, 0o040000).ok()?;
+                } else if selection == IdentitySelection::Remove {
+                    builder.insert(name, entry.id(), entry.filemode()).ok()?;
+                    builder.remove(name).ok()?;
+                }
+            }
+        }
+        Some(match builder {
+            Some(builder) => builder.write().ok()?,
+            None => input.id(),
+        })
+    }
+    repo.find_tree(select(repo, input, &paths, selection)?).ok()
+}
+
 pub fn compose_fast(
     transaction: &cache::Transaction,
     trees: Vec<git2::Oid>,
@@ -938,7 +1104,12 @@ pub fn get_blob(repo: &git2::Repository, tree: &git2::Tree, path: &Path) -> Stri
 }
 
 pub fn empty_id() -> git2::Oid {
-    git2::Oid::from_str("4b825dc642cb6eb9a060e54bf8d69288fbee4904").unwrap()
+    // The empty tree ID is fixed; avoid parsing forty hex digits on every check.
+    git2::Oid::from_bytes(&[
+        0x4b, 0x82, 0x5d, 0xc6, 0x42, 0xcb, 0x6e, 0xb9, 0xa0, 0x60, 0xe5, 0x4b, 0xf8, 0xd6, 0x92,
+        0x88, 0xfb, 0xee, 0x49, 0x04,
+    ])
+    .unwrap()
 }
 
 pub fn empty(repo: &git2::Repository) -> git2::Tree<'_> {
@@ -964,6 +1135,259 @@ mod tests {
         cache::sled_load(td.path()).unwrap();
         let ctx = cache::TransactionContext::new(td.path(), cache::CacheStack::default().into());
         ctx.open().unwrap()
+    }
+
+    #[test]
+    fn identity_file_selection_does_not_accept_normalized_destination_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(directory.path()).unwrap();
+        let transaction = open_transaction(&directory);
+        let repo = transaction.repo();
+        let input = make_tree(repo, &["alias-file", "alias-dir/selected", "keep"]);
+        let input = repo.find_tree(input).unwrap();
+        let keep = Filter::new().file("keep");
+        let wrapped = to_filter(Op::Chain(vec![
+            to_filter(Op::Subdir("alias-dir".into())),
+            to_filter(Op::File("selected".into(), "selected".into())),
+            to_filter(Op::Prefix("alias-dir/.".into())),
+        ]));
+        for selector in [
+            parse(":[::alias-file/.=alias-file,::keep]").unwrap(),
+            to_filter(Op::Compose(vec![wrapped, keep])),
+        ] {
+            let selected =
+                apply(&transaction, selector, Rewrite::from_tree(input.clone())).unwrap();
+            assert_eq!(selected.tree().id(), make_tree(repo, &["keep"]));
+
+            let excluded = apply(
+                &transaction,
+                to_filter(Op::Exclude(selector)),
+                Rewrite::from_tree(input.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                excluded.tree().id(),
+                make_tree(repo, &["alias-file", "alias-dir/selected"])
+            );
+        }
+    }
+
+    #[test]
+    fn identity_file_selection_preserves_unselectable_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        git2::Repository::init_bare(directory.path()).unwrap();
+        let transaction = open_transaction(&directory);
+        let repo = transaction.repo();
+        let blob = repo.blob(b"keep").unwrap();
+        let missing = git2::Oid::from_bytes(&[0xaa; 20]).unwrap();
+        // Write the historical tree directly since a treebuilder rejects `.git`.
+        let mut data = b"100644 .git\0".to_vec();
+        data.extend_from_slice(blob.as_bytes());
+        data.extend_from_slice(b"40000 broken\0");
+        data.extend_from_slice(missing.as_bytes());
+        let odb = repo.odb().unwrap();
+        let remaining = odb.write(git2::ObjectType::Tree, &data).unwrap();
+        data.extend_from_slice(b"100644 keep\0");
+        data.extend_from_slice(blob.as_bytes());
+        let input = repo
+            .find_tree(odb.write(git2::ObjectType::Tree, &data).unwrap())
+            .unwrap();
+        for spec in [":[::broken/missing,::keep]", ":[::.git,::keep]"] {
+            let selector = parse(spec).unwrap();
+            let selected =
+                apply(&transaction, selector, Rewrite::from_tree(input.clone())).unwrap();
+            assert_eq!(selected.tree().id(), make_tree(repo, &["keep"]));
+
+            let excluded = apply(
+                &transaction,
+                to_filter(Op::Exclude(selector)),
+                Rewrite::from_tree(input.clone()),
+            )
+            .unwrap();
+            assert_eq!(excluded.tree().id(), remaining);
+        }
+    }
+
+    #[test]
+    fn identity_file_selection_matches_general_compose() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let source = make_tree(
+            &repo,
+            &[
+                "root",
+                "a/one",
+                "a/two",
+                "a/deep/three",
+                "b/one",
+                "b/space name",
+                "b/[literal]",
+                ".hidden/x",
+            ],
+        );
+        let blob = repo.blob(b"target").unwrap();
+        let subtree = repo.find_tree(source).unwrap();
+        let mut builder = repo.treebuilder(Some(&subtree)).unwrap();
+        builder.insert("executable", blob, 0o100755).unwrap();
+        builder.insert("symlink", blob, 0o120000).unwrap();
+        builder
+            .insert(
+                "empty",
+                repo.treebuilder(None).unwrap().write().unwrap(),
+                0o040000,
+            )
+            .unwrap();
+        let a = repo.find_tree(subtree.get_name("a").unwrap().id()).unwrap();
+        let mut a_builder = repo.treebuilder(Some(&a)).unwrap();
+        a_builder.insert("empty", empty_id(), 0o040000).unwrap();
+        builder
+            .insert("a", a_builder.write().unwrap(), 0o040000)
+            .unwrap();
+        builder
+            .insert(
+                "submodule",
+                git2::Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                0o160000,
+            )
+            .unwrap();
+        let source = builder.write().unwrap();
+        cache::sled_load(directory.path()).unwrap();
+        let context =
+            cache::TransactionContext::new(directory.path(), cache::CacheStack::new().into());
+        let transaction = context.open().unwrap();
+        let input = transaction.repo().find_tree(source).unwrap();
+        let paths = [
+            "root",
+            "a",
+            "a/deep",
+            "a/empty",
+            "b",
+            "empty",
+            "a/one",
+            "a/two",
+            "a/deep/three",
+            "b/one",
+            "b/space name",
+            "b/[literal]",
+            ".hidden/x",
+            "executable",
+            "symlink",
+            "submodule",
+            "absent",
+            "a/missing",
+            "root/impossible",
+            "empty/missing",
+        ];
+        for seed in 0..64 {
+            let mut filters: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| ((i * 7 + seed * 13) % 11) < 7)
+                .map(|(_, p)| to_filter(Op::File((*p).into(), (*p).into())))
+                .collect();
+            filters.extend(filters.first().copied()); // duplicate identity selections
+            if seed % 2 == 0 {
+                filters.reverse();
+            }
+            let applied: Vec<_> = filters
+                .iter()
+                .map(|f| {
+                    apply(&transaction, *f, Rewrite::from_tree(input.clone()))
+                        .unwrap()
+                        .tree()
+                        .clone()
+                })
+                .collect();
+            let expected = compose(&transaction, filters.iter().zip(applied).collect())
+                .unwrap()
+                .id();
+            let actual = select_identity_files(
+                transaction.repo(),
+                &input,
+                &filters,
+                IdentitySelection::Keep,
+            )
+            .unwrap()
+            .id();
+            assert_eq!(actual, expected, "subset {seed}");
+            let excluded = subtract(&transaction, source, expected).unwrap();
+            assert_eq!(
+                select_identity_files(
+                    transaction.repo(),
+                    &input,
+                    &filters,
+                    IdentitySelection::Remove
+                )
+                .unwrap()
+                .id(),
+                excluded,
+                "excluded subset {seed}"
+            );
+
+            let optimized = crate::filter::compose(&filters);
+            assert_eq!(
+                apply(&transaction, optimized, Rewrite::from_tree(input.clone()))
+                    .unwrap()
+                    .tree()
+                    .id(),
+                expected,
+                "optimized subset {seed}"
+            );
+        }
+        // An empty policy, absent leaves, and terminal empty trees all leave
+        // exclusions unchanged. Compare against the general implementation.
+        for excluded_paths in [
+            vec![],
+            vec!["absent"],
+            vec!["a/missing", "empty/missing", "root/impossible"],
+            vec!["a/empty", "empty"],
+        ] {
+            let filters: Vec<_> = excluded_paths
+                .iter()
+                .map(|path| to_filter(Op::File((*path).into(), (*path).into())))
+                .collect();
+            let applied: Vec<_> = filters
+                .iter()
+                .map(|filter| {
+                    apply(&transaction, *filter, Rewrite::from_tree(input.clone()))
+                        .unwrap()
+                        .tree()
+                        .clone()
+                })
+                .collect();
+            let selected = compose(&transaction, filters.iter().zip(applied).collect())
+                .unwrap()
+                .id();
+            let expected = subtract(&transaction, source, selected).unwrap();
+            assert_eq!(expected, source);
+            assert_eq!(
+                select_identity_files(
+                    transaction.repo(),
+                    &input,
+                    &filters,
+                    IdentitySelection::Remove,
+                )
+                .unwrap()
+                .id(),
+                expected,
+            );
+        }
+        for filters in [
+            vec![to_filter(Op::File("other".into(), "root".into()))],
+            vec![to_filter(Op::File("/root".into(), "/root".into()))],
+            vec![to_filter(Op::File("a/../root".into(), "a/../root".into()))],
+            vec![Filter::new().subdir("a")],
+        ] {
+            assert!(
+                select_identity_files(
+                    transaction.repo(),
+                    &input,
+                    &filters,
+                    IdentitySelection::Keep
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
@@ -1498,5 +1922,83 @@ mod tests {
             added,
             vec![("dir/file1".to_string(), 1), ("dir/file2".to_string(), 1)]
         );
+    }
+    #[test]
+    fn intersection_entry_kinds_preserve_content_modes_and_empty_subtrees() {
+        // Reference the previous OID-only traversal, including type changes and
+        // explicit empty subtrees; a right-hand empty tree must drop a blob.
+        fn reference(repo: &git2::Repository, left: git2::Oid, right: git2::Oid) -> git2::Oid {
+            if left == right {
+                return left;
+            }
+            if left == empty_id() || right == empty_id() {
+                return empty_id();
+            }
+            if let (Ok(left), Ok(right)) = (repo.find_tree(left), repo.find_tree(right)) {
+                let mut result = repo.treebuilder(None).unwrap();
+                for entry in right.iter() {
+                    let name = entry.name().unwrap();
+                    if let Some(original) = left.get_name(name) {
+                        let child = reference(repo, original.id(), entry.id());
+                        if child != empty_id() && child != git2::Oid::zero() {
+                            result.insert(name, child, original.filemode()).unwrap();
+                        }
+                    }
+                }
+                result.write().unwrap()
+            } else {
+                left
+            }
+        }
+        let directory = tempfile::TempDir::new().unwrap();
+        git2::Repository::init_bare(directory.path()).unwrap();
+        let transaction = open_transaction(&directory);
+        let repo = transaction.repo();
+        let first = repo.blob(b"first contents").unwrap();
+        let second = repo.blob(b"changed contents").unwrap();
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        let mut nested = repo.treebuilder(None).unwrap();
+        nested.insert("shared", first, 0o100755).unwrap();
+        let first_tree = nested.write().unwrap();
+        nested.insert("shared", second, 0o100644).unwrap();
+        nested.insert("new", first, 0o100644).unwrap();
+        let second_tree = nested.write().unwrap();
+        let signature = git2::Signature::now("Example", "example@example.com").unwrap();
+        let commit = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "Submodule",
+                &repo.find_tree(empty).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let entries = [
+            (first, 0o100644),
+            (second, 0o100644),
+            (first, 0o100755),
+            (second, 0o120000),
+            (first_tree, 0o040000),
+            (second_tree, 0o040000),
+            (empty, 0o040000),
+            (commit, 0o160000),
+        ];
+        let mut trees = vec![empty];
+        for (oid, mode) in entries {
+            let mut tree = repo.treebuilder(None).unwrap();
+            tree.insert("same-name", oid, mode).unwrap();
+            tree.insert("unchanged", first, 0o100644).unwrap();
+            trees.push(tree.write().unwrap());
+        }
+        for left in &trees {
+            for right in &trees {
+                assert_eq!(
+                    intersect(&transaction, *left, *right).unwrap(),
+                    reference(repo, *left, *right),
+                    "{left} intersect {right}"
+                );
+            }
+        }
     }
 }

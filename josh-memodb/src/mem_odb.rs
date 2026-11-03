@@ -36,6 +36,7 @@ struct Inner {
 pub struct MemOdb {
     inner: Mutex<Inner>,
     limit: Option<usize>,
+    pack_threads: Option<u32>,
     /// Repository the store is registered on, re-opened by the background flusher to run the
     /// packbuilder (a `git2::Repository` is not `Send`).
     repo_path: PathBuf,
@@ -50,12 +51,27 @@ impl MemOdb {
     /// transaction and the libgit2 backend registered on its repository. `limit` bounds the total
     /// buffered object data: once exceeded the store flushes itself to a packfile (`None` = unbounded).
     pub fn new(limit: Option<usize>, repo_path: PathBuf) -> Arc<MemOdb> {
+        Self::create(limit, repo_path, None)
+    }
+
+    /// Set workers for this store without changing repository configuration.
+    /// Zero asks libgit2 to detect CPUs; omission keeps its single-worker default.
+    pub fn new_with_pack_threads(
+        limit: Option<usize>,
+        repo_path: PathBuf,
+        threads: u32,
+    ) -> Arc<MemOdb> {
+        Self::create(limit, repo_path, Some(threads))
+    }
+
+    fn create(limit: Option<usize>, repo_path: PathBuf, pack_threads: Option<u32>) -> Arc<MemOdb> {
         Arc::new(MemOdb {
             inner: Mutex::new(Inner {
                 map: Default::default(),
                 size: 0,
             }),
             limit,
+            pack_threads,
             repo_path,
             chunk_in_flight: AtomicBool::new(false),
         })
@@ -145,8 +161,36 @@ impl MemOdb {
         let to_pack = odb_backend::filter_absent_on_disk(&repo, &oids);
         if !to_pack.is_empty() {
             let mut pb = repo.packbuilder()?;
-            for oid in &to_pack {
-                pb.insert_object(*oid, None)?;
+            // Preserve libgit2's single-worker default unless this store opts in.
+            if let Some(threads) = self.pack_threads {
+                pb.set_threads(threads);
+            }
+            // The last tree-entry name groups similarly shaped trees for delta search.
+            // Walk record boundaries without interpreting modes or rewriting any bytes.
+            // This is only a packing hint: it never changes object bytes or ids. Copy
+            // the short hints before insertion, which reads through the same mutex.
+            let names: Vec<_> = {
+                let inner = self.inner.lock().unwrap();
+                to_pack
+                    .iter()
+                    .map(|oid| {
+                        let (kind, data) = inner.map.get(oid)?;
+                        if *kind != raw::GIT_OBJECT_TREE {
+                            return None;
+                        }
+                        let mut remaining = data.as_ref();
+                        let mut name = None;
+                        while !remaining.is_empty() {
+                            let end = remaining.iter().position(|byte| *byte == 0)?;
+                            name = std::str::from_utf8(&remaining[..end]).ok();
+                            remaining = remaining.get(end + 1 + Oid::zero().as_bytes().len()..)?;
+                        }
+                        name.map(str::to_owned)
+                    })
+                    .collect()
+            };
+            for (oid, name) in to_pack.iter().zip(&names) {
+                pb.insert_object(*oid, name.as_deref())?;
             }
             // `packfile_path` resolves the common object directory, so this is correct for linked
             // worktrees (whose gitdir has no `objects/` of its own) as well as normal repos.
@@ -205,7 +249,7 @@ impl OdbBackend for MemBackend {
             .ok_or_else(not_found)
     }
 
-    fn write(&mut self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error> {
+    fn write(&self, oid: Oid, data: Vec<u8>, kind: ObjectType) -> Result<(), git2::Error> {
         let overflow = self.store.insert(oid, kind.raw(), data.into_boxed_slice());
         if overflow {
             self.store.enqueue_chunk();
@@ -262,6 +306,74 @@ mod tests {
 
         // The store is drained: a second flush is a no-op.
         store.flush().unwrap();
+    }
+
+    #[test]
+    fn tree_pack_hints_preserve_raw_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let store = MemOdb::new(None, repo.path().to_owned());
+        store.register(&repo);
+        let mut trees = Vec::new();
+        for index in 0..32 {
+            let blob = repo.blob(format!("content {index}").as_bytes()).unwrap();
+            for name in [b"ordinary".as_slice(), b"bad\xff", b"space name"] {
+                let mut builder = repo.treebuilder(None).unwrap();
+                builder.insert(name, blob, 0o100644).unwrap();
+                let oid = builder.write().unwrap();
+                let bytes = repo.odb().unwrap().read(oid).unwrap().data().to_vec();
+                trees.push((oid, bytes));
+            }
+            // Exercise the full record walk and both a valid and invalid UTF-8 tail.
+            for names in [
+                [b"a".as_slice(), b"z".as_slice()],
+                [b"a".as_slice(), b"z\xff".as_slice()],
+                [b"a\xff".as_slice(), b"z".as_slice()],
+            ] {
+                let mut builder = repo.treebuilder(None).unwrap();
+                for name in names {
+                    builder.insert(name, blob, 0o100644).unwrap();
+                }
+                let oid = builder.write().unwrap();
+                let bytes = repo.odb().unwrap().read(oid).unwrap().data().to_vec();
+                trees.push((oid, bytes));
+            }
+        }
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        trees.push((empty, Vec::new()));
+        store.flush().unwrap();
+        let fresh = git2::Repository::open_bare(directory.path()).unwrap();
+        let odb = fresh.odb().unwrap();
+        for (oid, bytes) in trees {
+            let object = odb.read(oid).unwrap();
+            assert_eq!(object.kind(), ObjectType::Tree);
+            assert_eq!(object.data(), bytes);
+        }
+    }
+
+    #[test]
+    fn explicit_workers_preserve_objects_without_changing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        repo.config().unwrap().set_i32("pack.threads", -1).unwrap();
+        let store = MemOdb::new_with_pack_threads(Some(16), repo.path().to_owned(), 4);
+        store.register(&repo);
+        // Exercise the overflow flusher's reopened repository as well as the final drain.
+        let first = repo.blob(&b"overflow".repeat(100)).unwrap();
+        assert!(wait_on_disk(directory.path(), first));
+        let contents: Vec<_> = (0..200)
+            .map(|index| format!("{}-{index}", "similar packed content".repeat(100)))
+            .collect();
+        let ids: Vec<_> = contents
+            .iter()
+            .map(|content| repo.blob(content.as_bytes()).unwrap())
+            .collect();
+        store.flush().unwrap();
+        let fresh = git2::Repository::open_bare(directory.path()).unwrap();
+        for (id, content) in ids.iter().zip(&contents) {
+            assert_eq!(fresh.find_blob(*id).unwrap().content(), content.as_bytes());
+        }
+        assert_eq!(fresh.config().unwrap().get_i32("pack.threads").unwrap(), -1);
     }
 
     /// A linked worktree's gitdir has no `objects/` of its own, so the flush must write into the
