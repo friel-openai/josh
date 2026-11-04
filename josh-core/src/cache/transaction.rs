@@ -41,6 +41,7 @@ pub struct TransactionContext {
     mem_odb_limit: Option<usize>,
     mem_odb_pack_threads: Option<u32>,
     ephemeral: bool,
+    identity_selection_cache_capacity: usize,
 }
 
 impl TransactionContext {
@@ -55,6 +56,7 @@ impl TransactionContext {
             mem_odb_limit: None,
             mem_odb_pack_threads: None,
             ephemeral: false,
+            identity_selection_cache_capacity: 0,
         })
     }
 
@@ -66,11 +68,20 @@ impl TransactionContext {
             mem_odb_limit: None,
             mem_odb_pack_threads: None,
             ephemeral: false,
+            identity_selection_cache_capacity: 0,
         }
     }
 
     pub fn with_ref_prefix(mut self, prefix: impl AsRef<str>) -> Self {
         self.ref_prefix = Some(prefix.as_ref().to_string());
+        self
+    }
+
+    /// Opt into bounded subtree selection memoization within each transaction.
+    /// Disabled by default. Zero also skips selector fingerprinting, allowing
+    /// callers to roll back the optimization without changing filter identities.
+    pub fn with_identity_selection_cache_capacity(mut self, capacity: usize) -> Self {
+        self.identity_selection_cache_capacity = capacity;
         self
     }
 
@@ -108,6 +119,7 @@ impl TransactionContext {
             self.mem_odb_limit,
             self.mem_odb_pack_threads,
             self.ephemeral,
+            self.identity_selection_cache_capacity,
         ))
     }
 }
@@ -136,6 +148,7 @@ struct Transaction2 {
 
 pub struct Transaction {
     t2: std::cell::RefCell<Transaction2>,
+    pub(crate) identity_selection_cache: std::cell::RefCell<super::IdentitySelectionCache>,
     repo: git2::Repository,
     /// Per-transaction in-memory object store, flushed to a packfile when the transaction drops, at
     /// an explicit boundary, or mid-transaction when it exceeds its size limit. Never shared with
@@ -169,6 +182,7 @@ impl Transaction {
         mem_odb_limit: Option<usize>,
         mem_odb_pack_threads: Option<u32>,
         ephemeral: bool,
+        identity_selection_cache_capacity: usize,
     ) -> Transaction {
         // Turn off libgit2's strictness checks. These are process-wide C globals, set
         // exactly once.
@@ -201,6 +215,9 @@ impl Transaction {
             sled_open_josh_trees().expect("failed to open transaction");
 
         Transaction {
+            identity_selection_cache: std::cell::RefCell::new(super::IdentitySelectionCache::new(
+                identity_selection_cache_capacity,
+            )),
             t2: std::cell::RefCell::new(Transaction2 {
                 commit_map: HashMap::new(),
                 apply_map: HashMap::new(),
@@ -238,6 +255,7 @@ impl Transaction {
             mem_odb_limit: self.mem_odb_limit,
             mem_odb_pack_threads: self.mem_odb_pack_threads,
             ephemeral: self.ephemeral,
+            identity_selection_cache_capacity: self.identity_selection_cache.borrow().capacity(),
         };
 
         context.open()
@@ -245,6 +263,10 @@ impl Transaction {
 
     pub fn repo(&self) -> &git2::Repository {
         &self.repo
+    }
+
+    pub fn identity_selection_cache_stats(&self) -> super::IdentitySelectionCacheStats {
+        self.identity_selection_cache.borrow().stats()
     }
 
     // TODO: remove and rework proxy git launch path to use spawn_git

@@ -881,17 +881,44 @@ pub(super) enum IdentitySelection {
 /// Return None when the general evaluator must handle a filter or tree operation.
 /// The filter itself is unchanged, including its persistent cache key.
 pub(super) fn select_identity_files<'a>(
-    repo: &'a git2::Repository,
+    transaction: &'a cache::Transaction,
     input: &git2::Tree<'a>,
     filters: &[Filter],
     selection: IdentitySelection,
 ) -> Option<git2::Tree<'a>> {
+    let repo = transaction.repo();
     // Filter nodes are immutable and interned. Borrow path components rather than
     // cloning every path each time a tree is selected.
     #[derive(Default)]
     struct Paths {
         terminal: bool,
         children: std::collections::BTreeMap<&'static str, Paths>,
+        cache_key: Option<git2::Oid>,
+    }
+    impl Paths {
+        fn fingerprint(&mut self) -> Option<git2::Oid> {
+            // Length-prefix names, retain their exact bytes, and distinguish a
+            // terminal subtree selector from a list of selected descendants.
+            // Git's object hash gives these immutable policies content identities
+            // without retaining another unbounded interning table.
+            static TERMINAL: std::sync::LazyLock<git2::Oid> = std::sync::LazyLock::new(|| {
+                git2::Oid::hash_object(git2::ObjectType::Blob, b"josh-identity-selector-v1\x01")
+                    .expect("hash terminal selector")
+            });
+            let id = if self.terminal {
+                *TERMINAL
+            } else {
+                let mut bytes = b"josh-identity-selector-v1\x00".to_vec();
+                for (name, child) in &mut self.children {
+                    bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
+                    bytes.extend_from_slice(name.as_bytes());
+                    bytes.extend_from_slice(child.fingerprint()?.as_bytes());
+                }
+                git2::Oid::hash_object(git2::ObjectType::Blob, &bytes).ok()?
+            };
+            self.cache_key = Some(id);
+            Some(id)
+        }
     }
     fn descend<'a>(mut node: &'a mut Paths, path: &'static Path) -> Option<&'a mut Paths> {
         let text = path.to_str()?;
@@ -959,12 +986,30 @@ pub(super) fn select_identity_files<'a>(
     for filter in filters {
         collect(*filter, &mut paths)?;
     }
+    if transaction.identity_selection_cache.borrow().capacity() != 0 {
+        paths.fingerprint()?;
+    }
     fn select(
-        repo: &git2::Repository,
+        transaction: &cache::Transaction,
         input: &git2::Tree<'_>,
         paths: &Paths,
         selection: IdentitySelection,
     ) -> Option<git2::Oid> {
+        let repo = transaction.repo();
+        let key = paths.cache_key.map(|selector| cache::IdentitySelectionKey {
+            tree: input.id(),
+            selector,
+            remove: selection == IdentitySelection::Remove,
+        });
+        if let Some(key) = key {
+            let cached = transaction.identity_selection_cache.borrow_mut().get(key);
+            if let Some(output) = cached {
+                // Keep the normal traversal/fallback if an output is unavailable.
+                if repo.find_tree(output).is_ok() {
+                    return Some(output);
+                }
+            }
+        }
         // Exclusions often leave a subtree unchanged. Copy its entries into a
         // builder only after finding an entry that actually needs to change.
         let mut builder = match selection {
@@ -1002,7 +1047,7 @@ pub(super) fn select_identity_files<'a>(
                 }
             } else if entry.kind() == Some(git2::ObjectType::Tree) {
                 let subtree = repo.find_tree(entry.id()).ok()?;
-                let output = select(repo, &subtree, selected, selection)?;
+                let output = select(transaction, &subtree, selected, selection)?;
                 if selection == IdentitySelection::Remove && output == entry.id() {
                     continue;
                 }
@@ -1018,12 +1063,20 @@ pub(super) fn select_identity_files<'a>(
                 }
             }
         }
-        Some(match builder {
+        let output = match builder {
             Some(builder) => builder.write().ok()?,
             None => input.id(),
-        })
+        };
+        if let Some(key) = key {
+            transaction
+                .identity_selection_cache
+                .borrow_mut()
+                .insert(key, output);
+        }
+        Some(output)
     }
-    repo.find_tree(select(repo, input, &paths, selection)?).ok()
+    repo.find_tree(select(transaction, input, &paths, selection)?)
+        .ok()
 }
 
 pub fn compose_fast(
@@ -1253,7 +1306,8 @@ mod tests {
         let source = builder.write().unwrap();
         cache::sled_load(directory.path()).unwrap();
         let context =
-            cache::TransactionContext::new(directory.path(), cache::CacheStack::new().into());
+            cache::TransactionContext::new(directory.path(), cache::CacheStack::new().into())
+                .with_identity_selection_cache_capacity(262_144);
         let transaction = context.open().unwrap();
         let input = transaction.repo().find_tree(source).unwrap();
         let paths = [
@@ -1301,25 +1355,16 @@ mod tests {
             let expected = compose(&transaction, filters.iter().zip(applied).collect())
                 .unwrap()
                 .id();
-            let actual = select_identity_files(
-                transaction.repo(),
-                &input,
-                &filters,
-                IdentitySelection::Keep,
-            )
-            .unwrap()
-            .id();
+            let actual =
+                select_identity_files(&transaction, &input, &filters, IdentitySelection::Keep)
+                    .unwrap()
+                    .id();
             assert_eq!(actual, expected, "subset {seed}");
             let excluded = subtract(&transaction, source, expected).unwrap();
             assert_eq!(
-                select_identity_files(
-                    transaction.repo(),
-                    &input,
-                    &filters,
-                    IdentitySelection::Remove
-                )
-                .unwrap()
-                .id(),
+                select_identity_files(&transaction, &input, &filters, IdentitySelection::Remove)
+                    .unwrap()
+                    .id(),
                 excluded,
                 "excluded subset {seed}"
             );
@@ -1361,14 +1406,9 @@ mod tests {
             let expected = subtract(&transaction, source, selected).unwrap();
             assert_eq!(expected, source);
             assert_eq!(
-                select_identity_files(
-                    transaction.repo(),
-                    &input,
-                    &filters,
-                    IdentitySelection::Remove,
-                )
-                .unwrap()
-                .id(),
+                select_identity_files(&transaction, &input, &filters, IdentitySelection::Remove,)
+                    .unwrap()
+                    .id(),
                 expected,
             );
         }
@@ -1379,15 +1419,104 @@ mod tests {
             vec![Filter::new().subdir("a")],
         ] {
             assert!(
-                select_identity_files(
-                    transaction.repo(),
-                    &input,
-                    &filters,
-                    IdentitySelection::Keep
-                )
-                .is_none()
+                select_identity_files(&transaction, &input, &filters, IdentitySelection::Keep)
+                    .is_none()
             );
         }
+    }
+
+    #[test]
+    fn identity_selection_cache_reuses_only_matching_subtree_policies() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let first = make_tree(&repo, &["a/x", "a/y", "b/x", "b/y", "root"]);
+        let second = make_tree(&repo, &["a/x", "a/y", "a/z", "b/x", "b/y", "root"]);
+        cache::sled_load(directory.path()).unwrap();
+        let context =
+            cache::TransactionContext::new(directory.path(), cache::CacheStack::new().into());
+        let baseline = context.open().unwrap();
+        let cached = context
+            .with_identity_selection_cache_capacity(262_144)
+            .open()
+            .unwrap();
+        let select = |transaction: &cache::Transaction, source, paths: &[&str], mode| {
+            let tree = transaction.repo().find_tree(source).unwrap();
+            let filters: Vec<_> = paths.iter().map(|p| Filter::new().file(p)).collect();
+            select_identity_files(transaction, &tree, &filters, mode)
+                .unwrap()
+                .id()
+        };
+        let paths = ["a/x", "b/x"];
+        select(&cached, first, &paths, IdentitySelection::Keep);
+        let before = cached.identity_selection_cache_stats();
+        assert_eq!(
+            select(&cached, second, &paths, IdentitySelection::Keep),
+            select(&baseline, second, &paths, IdentitySelection::Keep),
+        );
+        let after = cached.identity_selection_cache_stats();
+        assert!(
+            after.hits > before.hits,
+            "unchanged b subtree must be reused"
+        );
+        assert!(
+            after.misses > before.misses,
+            "changed input a must be recomputed"
+        );
+
+        // Changed policy on a stable input, terminal directory vs selected
+        // descendants, duplicate/reordered paths, and both selection modes.
+        for paths in [
+            vec!["a/y", "b/x"],
+            vec!["a", "b/x"],
+            vec!["a/x", "b/y"],
+            vec!["b/x", "a/x", "a/x"],
+            vec!["missing", "root/impossible"],
+            vec![],
+        ] {
+            for source in [first, second] {
+                for mode in [IdentitySelection::Keep, IdentitySelection::Remove] {
+                    assert_eq!(
+                        select(&cached, source, &paths, mode),
+                        select(&baseline, source, &paths, mode)
+                    );
+                }
+            }
+        }
+        assert_eq!(baseline.identity_selection_cache_stats().misses, 0);
+        assert_eq!(baseline.identity_selection_cache_stats().entries, 0);
+        let cloned = cached.try_clone().unwrap();
+        assert_eq!(cloned.identity_selection_cache_stats().entries, 0);
+        assert_eq!(cloned.identity_selection_cache.borrow().capacity(), 262_144);
+    }
+
+    #[test]
+    fn identity_selection_cache_eviction_preserves_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(directory.path()).unwrap();
+        let source = make_tree(&repo, &["a/x", "a/y", "b/x", "b/y", "c/z"]);
+        cache::sled_load(directory.path()).unwrap();
+        let cached =
+            cache::TransactionContext::new(directory.path(), cache::CacheStack::new().into())
+                .with_identity_selection_cache_capacity(2)
+                .open()
+                .unwrap();
+        let input = cached.repo().find_tree(source).unwrap();
+        let filters = [
+            Filter::new().file("a/x"),
+            Filter::new().file("b/y"),
+            Filter::new().file("c/z"),
+        ];
+        let expected = make_tree(cached.repo(), &["a/x", "b/y", "c/z"]);
+        for _ in 0..3 {
+            assert_eq!(
+                select_identity_files(&cached, &input, &filters, IdentitySelection::Keep)
+                    .unwrap()
+                    .id(),
+                expected
+            );
+            assert!(cached.identity_selection_cache_stats().entries <= 2);
+        }
+        assert!(cached.identity_selection_cache_stats().evictions > 0);
     }
 
     #[test]
