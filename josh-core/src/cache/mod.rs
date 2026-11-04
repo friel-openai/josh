@@ -1,6 +1,7 @@
 mod backend;
 pub mod distributed;
 mod history_graph;
+mod identity_selection;
 pub mod sled;
 pub mod stack;
 mod transaction;
@@ -15,6 +16,8 @@ pub use history_graph::{
     HistoryGraphInfo, collect_history_graph_info, compute_history_hint, compute_sequence_number,
     parents_share_root,
 };
+pub use identity_selection::IdentitySelectionCacheStats;
+pub(crate) use identity_selection::{IdentitySelectionCache, IdentitySelectionKey};
 pub use sled::{SledCacheBackend, sled_clear, sled_load, sled_open_josh_trees, sled_print_stats};
 pub use stack::CacheStack;
 pub use transaction::*;
