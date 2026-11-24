@@ -591,22 +591,22 @@ Note that ws/d/ is now present in the ws
       |   |   `-- 5eaa207c7aba64f4deb19a9acd060c254fb239
       |   |-- info
       |   `-- pack
-      |       |-- pack-0a5087aa14c50693a3d73b25e94466c4b21c7d30.idx
-      |       |-- pack-0a5087aa14c50693a3d73b25e94466c4b21c7d30.pack
-      |       |-- pack-132b596594e7cf7bc3af1b2c7a24fdf62d759469.idx
-      |       |-- pack-132b596594e7cf7bc3af1b2c7a24fdf62d759469.pack
-      |       |-- pack-369060c82a79aba08c50857e8818b02e9fb2578f.idx
-      |       |-- pack-369060c82a79aba08c50857e8818b02e9fb2578f.pack
-      |       |-- pack-56434dd1073324f0c25f881a1c87eff63af5c27e.idx
-      |       |-- pack-56434dd1073324f0c25f881a1c87eff63af5c27e.pack
-      |       |-- pack-721a5e2fcf4ed965e49124b30f161a6faead2313.idx
-      |       |-- pack-721a5e2fcf4ed965e49124b30f161a6faead2313.pack
-      |       |-- pack-78f8060245d0cbe6e14e9baffbd43827973328cd.idx
-      |       |-- pack-78f8060245d0cbe6e14e9baffbd43827973328cd.pack
-      |       |-- pack-ac69f084a822e26e92fcd950197630c5d06a5ddf.idx
-      |       |-- pack-ac69f084a822e26e92fcd950197630c5d06a5ddf.pack
-      |       |-- pack-f856631ca92126724726c23f44d834967dbcc5de.idx
-      |       `-- pack-f856631ca92126724726c23f44d834967dbcc5de.pack
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       `-- pack-[0-9a-f]{40}\.pack (re)
       `-- refs
           |-- heads
           |-- namespaces
@@ -615,3 +615,8 @@ Note that ws/d/ is now present in the ws
   84 directories, 87 files
 
 $ cat ${TESTTMP}/josh-proxy.out
+
+Pack filenames describe encoding choices, not repository semantics. Keep the
+format/count assertions above and verify every pack/index pair independently.
+
+  $ find "${TESTTMP}/remote/scratch" -name "*.idx" -exec git verify-pack {} +

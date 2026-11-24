@@ -286,6 +286,7 @@ pub(crate) fn spec2(op: &Op) -> String {
                 )
             }
         }
+        Op::PruneEmptyDirectories => ":prune-empty-dirs".to_string(),
         Op::Prune => ":prune=trivial-merge".to_string(),
         Op::Prefix(path) => format!(":prefix={}", parse::quote_if(&path.to_string_lossy())),
         Op::Pattern(glob) => format!("::{}", parse::quote_if(glob.as_str())),

@@ -47,6 +47,19 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0
+    - name: Test CI cache selection
+      run: bash .github/workflows/scripts/test-ci-cache.sh
+    - name: Select CI cache backend
+      id: cache
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      run: |
+        source .github/workflows/scripts/ci-cache-config.sh
+        printf 'remote=%s\n' "$JOSH_CI_REMOTE_CACHE" >> "$GITHUB_OUTPUT"
+        printf 'JOSH_CI_REMOTE_CACHE=%s\n' "$JOSH_CI_REMOTE_CACHE" >> "$GITHUB_ENV"
+        printf 'JOSH_CI_COMPOSE_FILTER=%s\n' "$JOSH_CI_COMPOSE_FILTER" >> "$GITHUB_ENV"
     - name: Get tags
       run: git fetch --tags origin
     - name: Install podman
@@ -62,51 +75,43 @@ jobs:
         AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       run: .github/workflows/scripts/bootstrap-josh.sh
     - name: Pull cached job markers and volumes from R2
-      if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+      if: steps.cache.outputs.remote == 'true'
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       run: |
         export PATH="$(pwd)/target/release:$PATH"
         export JOSH_EXPERIMENTAL_FEATURES=1
-        .github/workflows/scripts/pull-jobs.sh HEAD ":[::sidecars.josh=ci-sidecars.josh,:/]:+compose"
+        .github/workflows/scripts/pull-jobs.sh HEAD "$JOSH_CI_COMPOSE_FILTER"
     - name: Pull cached images from R2
-      if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+      if: steps.cache.outputs.remote == 'true'
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       run: |
         export PATH="$(pwd)/target/release:$PATH"
         export JOSH_EXPERIMENTAL_FEATURES=1
-        .github/workflows/scripts/pull-images.sh HEAD ":[::sidecars.josh=ci-sidecars.josh,:/]:+compose"
+        .github/workflows/scripts/pull-images.sh HEAD "$JOSH_CI_COMPOSE_FILTER"
     - name: Run tests
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      run: |
-        set -o pipefail
-        target/release/josh compose run HEAD \
-          ":[::sidecars.josh=ci-sidecars.josh,:/]:+compose" 2>&1 \
-          | tee /tmp/compose-run.log
-        if grep -q SCCACHE_REMOTE_CACHE_MISSING /tmp/compose-run.log; then
-          echo "::error::sccache remote cache was not used during the build"
-          exit 1
-        fi
+      run: bash .github/workflows/scripts/run-ci-tests.sh
     - name: Push job markers and volumes to R2
-      if: success() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
+      if: success() && steps.cache.outputs.remote == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       run: |
         export PATH="$(pwd)/target/release:$PATH"
         export JOSH_EXPERIMENTAL_FEATURES=1
-        .github/workflows/scripts/push-jobs.sh HEAD ":[::sidecars.josh=ci-sidecars.josh,:/]:+compose"
+        .github/workflows/scripts/push-jobs.sh HEAD "$JOSH_CI_COMPOSE_FILTER"
     - name: Push built images to R2
-      if: success() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
+      if: success() && steps.cache.outputs.remote == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       run: |
         export PATH="$(pwd)/target/release:$PATH"
         export JOSH_EXPERIMENTAL_FEATURES=1
-        .github/workflows/scripts/push-images.sh HEAD ":[::sidecars.josh=ci-sidecars.josh,:/]:+compose"
+        .github/workflows/scripts/push-images.sh HEAD "$JOSH_CI_COMPOSE_FILTER"

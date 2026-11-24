@@ -1221,6 +1221,14 @@ pub fn apply<'a>(
     let op = peel_op(filter);
     match &op {
         Op::Nop => Ok(x),
+        Op::PruneEmptyDirectories => {
+            let tree = tree::prune_empty_directories(
+                transaction,
+                x.tree().id(),
+                peel_filter(filter).id(),
+            )?;
+            Ok(x.with_tree(repo.find_tree(tree)?))
+        }
         Op::Empty => Ok(x.with_tree(tree::empty(repo))),
         Op::Fold => Ok(x),
         Op::Squash(None) => Ok(x),
