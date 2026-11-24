@@ -111,6 +111,7 @@ pub enum Op {
     Meta(std::collections::BTreeMap<String, String>, Filter),
 
     Nop,
+    PruneEmptyDirectories,
     Empty,
     Fold,
     Paths,

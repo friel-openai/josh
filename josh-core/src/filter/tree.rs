@@ -2,6 +2,50 @@ use super::*;
 use crate::objects;
 use anyhow::anyhow;
 
+/// Normalize only directory structure. Unlike a glob filter, retain gitlinks,
+/// symlinks, non-UTF-8 names, and the original modes of all retained entries.
+/// Results depend only on the input tree and operation, so unchanged subtrees
+/// are shared across commits and directory positions.
+pub fn prune_empty_directories(
+    transaction: &cache::Transaction,
+    input: git2::Oid,
+    key: git2::Oid,
+) -> anyhow::Result<git2::Oid> {
+    if let Some(cached) = transaction.get_glob((input, key, 0))
+        && transaction.repo().find_tree(cached).is_ok()
+    {
+        return Ok(cached);
+    }
+    let odb = transaction.repo().odb()?;
+    let object = odb.read(input)?;
+    if object.kind() != git2::ObjectType::Tree {
+        return Err(anyhow!("prune_empty_directories: {} is not a tree", input));
+    }
+    let tree = gix_object::TreeRef::from_bytes(object.data())?;
+    let mut rebuild = TreeRebuild::new(tree.entries.len());
+    for entry in &tree.entries {
+        let mut oid = objects::git2_oid(entry.oid);
+        if entry.mode.is_tree() {
+            oid = prune_empty_directories(transaction, oid, key)?;
+            if oid == empty_id() {
+                rebuild.mark_changed();
+                continue;
+            }
+            if oid != objects::git2_oid(entry.oid) {
+                rebuild.mark_changed();
+            }
+        }
+        rebuild.keep(gix_object::tree::Entry {
+            mode: entry.mode,
+            filename: entry.filename.to_owned(),
+            oid: objects::gix_oid(oid),
+        });
+    }
+    let result = rebuild.finish(&odb, input)?;
+    transaction.insert_glob((input, key, 0), result);
+    Ok(result)
+}
+
 pub fn pathstree<'a>(
     root: &str,
     input: git2::Oid,
@@ -1500,6 +1544,46 @@ mod tests {
     // A gitlink (submodule) entry must be dropped from the rebuilt tree -- and must therefore
     // defeat the "unchanged input" fast path -- while a symlink blob accepted by the predicate
     // keeps its 0o120000 filemode.
+    #[test]
+    fn prune_empty_directories_preserves_leaves_and_repairs_missing_cache() {
+        let td = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(td.path()).unwrap();
+        let blob = repo.blob(b"content").unwrap();
+        let submodule = git2::Oid::from_str("0123456789012345678901234567890123456789").unwrap();
+        let empty = repo.treebuilder(None).unwrap().write().unwrap();
+        let mut nested = repo.treebuilder(None).unwrap();
+        nested.insert("empty", empty, 0o40000).unwrap();
+        let mut baseline = repo.treebuilder(None).unwrap();
+        baseline.insert("file", blob, 0o100644).unwrap();
+        baseline.insert("executable", blob, 0o100755).unwrap();
+        baseline.insert("symlink", blob, 0o120000).unwrap();
+        baseline.insert("submodule", submodule, 0o160000).unwrap();
+        let expected = baseline.write().unwrap();
+        baseline
+            .insert("nested", nested.write().unwrap(), 0o40000)
+            .unwrap();
+        let input = baseline.write().unwrap();
+        let transaction = open_transaction(&td);
+        let key = Filter::new().prune_empty_directories().id();
+        assert_eq!(
+            prune_empty_directories(&transaction, input, key).unwrap(),
+            expected
+        );
+        assert_eq!(
+            prune_empty_directories(&transaction, expected, key).unwrap(),
+            expected
+        );
+        transaction.insert_glob((input, key, 0), submodule);
+        assert_eq!(
+            prune_empty_directories(&transaction, input, key).unwrap(),
+            expected
+        );
+        assert_eq!(
+            prune_empty_directories(&transaction, empty, key).unwrap(),
+            empty
+        );
+    }
+
     #[test]
     fn remove_pred_drops_gitlink_and_preserves_symlink_mode() {
         let td = tempfile::tempdir().unwrap();

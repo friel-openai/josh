@@ -359,12 +359,12 @@
       |   |   `-- 3dd93419493d22aeaf6bcb5c0bec4c2701b049
       |   |-- info
       |   `-- pack
-      |       |-- pack-89f5d1c01530839eab589ceec8565f11ff4679a5.idx
-      |       |-- pack-89f5d1c01530839eab589ceec8565f11ff4679a5.pack
-      |       |-- pack-a75d3ca2392eb679cf1dc24a3496576475f5e849.idx
-      |       |-- pack-a75d3ca2392eb679cf1dc24a3496576475f5e849.pack
-      |       |-- pack-c455f6d9504526b7c14867a795a5b2e27610956a.idx
-      |       `-- pack-c455f6d9504526b7c14867a795a5b2e27610956a.pack
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       `-- pack-[0-9a-f]{40}\.pack (re)
       `-- refs
           |-- heads
           |-- namespaces
@@ -373,3 +373,8 @@
   65 directories, 57 files
 
 $ cat ${TESTTMP}/josh-proxy.out | grep VIEW
+
+Pack filenames describe encoding choices, not repository semantics. Keep the
+format/count assertions above and verify every pack/index pair independently.
+
+  $ find "${TESTTMP}/remote/scratch" -name "*.idx" -exec git verify-pack {} +

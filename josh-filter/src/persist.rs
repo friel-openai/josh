@@ -480,6 +480,10 @@ impl<'a> InMemoryBuilder<'a> {
                 let blob = self.write_blob(b"");
                 push_blob_entries(&mut entries, [("nop", blob)]);
             }
+            Op::PruneEmptyDirectories => {
+                let blob = self.write_blob(b"");
+                push_blob_entries(&mut entries, [("prune-empty-dirs", blob)]);
+            }
             Op::Empty => {
                 let blob = self.write_blob(b"");
                 push_blob_entries(&mut entries, [("empty", blob)]);
@@ -676,6 +680,10 @@ fn from_tree2(repo: &git2::Repository, tree_oid: git2::Oid) -> anyhow::Result<Op
         "nop" => {
             let _ = repo.find_blob(entry.id())?;
             Ok(Op::Nop)
+        }
+        "prune-empty-dirs" => {
+            let _ = repo.find_blob(entry.id())?;
+            Ok(Op::PruneEmptyDirectories)
         }
         "empty" => {
             let _ = repo.find_blob(entry.id())?;

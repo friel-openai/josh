@@ -47,6 +47,7 @@ fn make_filter(args: &[&str]) -> anyhow::Result<Filter> {
         ["SQUASH"] => Ok(f.squash(None)),
         ["SQUASH", _ids @ ..] => Err(anyhow!("SQUASH with ids can't be parsed")),
         ["linear"] => Ok(f.linear()),
+        ["prune-empty-dirs"] => Ok(f.prune_empty_directories()),
         ["prune", "trivial-merge"] => Ok(f.prune_trivial_merge()),
         ["prune"] => Err(anyhow!(indoc!(
             r#"

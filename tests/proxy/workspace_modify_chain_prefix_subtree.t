@@ -448,16 +448,16 @@ Note that ws/d/ is now present in the ws
       |   |   `-- 3dd93419493d22aeaf6bcb5c0bec4c2701b049
       |   |-- info
       |   `-- pack
-      |       |-- pack-003dec79becceac35fcf4dc6da69067da9076b43.idx
-      |       |-- pack-003dec79becceac35fcf4dc6da69067da9076b43.pack
-      |       |-- pack-1ea36f2d466e060c9ea31389ae1b3cd2ef9ee1a0.idx
-      |       |-- pack-1ea36f2d466e060c9ea31389ae1b3cd2ef9ee1a0.pack
-      |       |-- pack-3bb8600225cc4139a131c5413ee7275d07ccd58a.idx
-      |       |-- pack-3bb8600225cc4139a131c5413ee7275d07ccd58a.pack
-      |       |-- pack-5f43de7285cc69f6f7f779f1c22bbcc404fea509.idx
-      |       |-- pack-5f43de7285cc69f6f7f779f1c22bbcc404fea509.pack
-      |       |-- pack-78ce499d43b7df7a0b507140d5134ff90a058eeb.idx
-      |       `-- pack-78ce499d43b7df7a0b507140d5134ff90a058eeb.pack
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       \|-- pack-[0-9a-f]{40}\.pack (re)
+      \|       \|-- pack-[0-9a-f]{40}\.idx (re)
+      \|       `-- pack-[0-9a-f]{40}\.pack (re)
       `-- refs
           |-- heads
           |-- namespaces
@@ -466,3 +466,8 @@ Note that ws/d/ is now present in the ws
   82 directories, 78 files
 
 $ cat ${TESTTMP}/josh-proxy.out | grep VIEW
+
+Pack filenames describe encoding choices, not repository semantics. Keep the
+format/count assertions above and verify every pack/index pair independently.
+
+  $ find "${TESTTMP}/remote/scratch" -name "*.idx" -exec git verify-pack {} +

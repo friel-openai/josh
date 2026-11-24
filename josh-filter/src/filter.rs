@@ -229,6 +229,11 @@ impl Filter {
         self.chain(to_filter(Op::Committer(name.into(), email.into())))
     }
 
+    /// Remove empty directories recursively, preserving every non-tree entry.
+    pub fn prune_empty_directories(self) -> Filter {
+        self.chain(to_filter(Op::PruneEmptyDirectories))
+    }
+
     /// Chain a filter that prunes trivial merge commits
     /// Removes merge commits where the tree is identical to the first parent
     pub fn prune_trivial_merge(self) -> Filter {
@@ -692,5 +697,20 @@ mod file_builder_tests {
             Filter::new().select(files).id().to_string(),
             "0f9d57f7877a72ecfbfc492c9b9902219e5341c0"
         );
+    }
+}
+
+#[cfg(test)]
+mod prune_empty_directory_tests {
+    use super::*;
+
+    #[test]
+    fn prune_empty_directories_roundtrips() {
+        let filter = Filter::new().prune_empty_directories();
+        let spec = crate::flang::spec(filter);
+        assert_eq!(spec, ":prune-empty-dirs");
+        assert_eq!(crate::flang::parse::parse(&spec).unwrap(), filter);
+        assert_ne!(filter.id(), Filter::new().id());
+        assert!(crate::opt::invert(filter).is_err());
     }
 }
